@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 运行期与敏感凭据产物：绝不可提交
+.workbuddy/
+.smoke/
+.ref/
+*.log
+*.env
+vault.json
+vault.json.*
+vault.lock
+vault.lock.lease
+vault.env
+state.json
+*_cred.json
+db_cookie*.txt
+qoder_*.json
