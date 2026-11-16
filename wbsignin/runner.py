@@ -51,6 +51,7 @@ class AccountOutcome:
     refresh_error: str = ""
     hint: str = ""
     note: str = ""
+    device_update: Optional[Dict[str, Any]] = None
 
     @property
     def masked(self) -> str:
@@ -533,9 +534,29 @@ def _work_trae(acc: Account, want_credits: bool) -> AccountOutcome:
     if not acc.access_token:
         out.refresh_error = "缺少 TRAE CN token，需重新导入"
         return out
-    out.checkin = trae.trae_checkin(acc.access_token, acc.device)
+    dev = dict(acc.device) if isinstance(acc.device, dict) else {}
+    out.checkin = trae.trae_checkin(acc.access_token, dev)
+    if (
+        out.checkin
+        and isinstance(out.checkin.raw, dict)
+        and out.checkin.raw.get("code") == 9074
+        and not dev.get("installId")
+    ):
+        try:
+            reg = trae.register_cn_device(
+                str(dev.get("appVersion") or trae.DEFAULT_APP_VERSION)
+            )
+            new_dev = dict(dev)
+            new_dev["ugDeviceId"] = reg["deviceId"]
+            new_dev["installId"] = reg["installId"]
+            new_dev.setdefault("osVersion", reg.get("osVersion") or "11")
+            out.checkin = trae.trae_checkin(acc.access_token, new_dev)
+            out.device_update = new_dev
+            dev = new_dev
+        except httpc.ApiError:
+            pass
     if want_credits and not (out.checkin and out.checkin.kind == httpc.KIND_AUTH):
-        snap, exp = trae.trae_credits(acc.access_token, acc.device)
+        snap, exp = trae.trae_credits(acc.access_token, dev)
         out.credits = snap
         out.expiry = exp
     return out
@@ -624,6 +645,10 @@ def run(
                 cur = fresh.get(out.phone)
                 if cur is None:
                     continue
+                if isinstance(out.device_update, dict):
+                    merged_dev = dict(cur.device) if isinstance(cur.device, dict) else {}
+                    merged_dev.update(out.device_update)
+                    cur.device = merged_dev
                 if out.refresh_error:
                     cur.last_error = out.refresh_error
                 elif out.checkin and out.checkin.status in (ST_SIGNED, ST_ALREADY):

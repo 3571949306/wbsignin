@@ -163,8 +163,11 @@ def request(
     data = None
     hdrs = dict(headers or {})
     if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        hdrs.setdefault("Content-Type", "application/json")
+        if isinstance(body, (bytes, bytearray)):
+            data = bytes(body)
+        else:
+            data = json.dumps(body).encode("utf-8")
+            hdrs.setdefault("Content-Type", "application/json")
 
     last: Optional[Exception] = None
     resp: Optional[Response] = None

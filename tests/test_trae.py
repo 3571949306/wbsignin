@@ -78,6 +78,7 @@ class TraeHelpersAndCryptoTests(unittest.TestCase):
     def test_config_and_account_roundtrip(self):
         self.assertIn("api.trae.cn", config.ALLOWED_HOSTS)
         self.assertIn("api.trae.com.cn", config.ALLOWED_HOSTS)
+        self.assertIn("log.snssdk.com", config.ALLOWED_HOSTS)
         acc = Account.from_dict(
             "trae-cn:u100",
             {
@@ -93,6 +94,21 @@ class TraeHelpersAndCryptoTests(unittest.TestCase):
         self.assertFalse(acc.is_qoder)
         self.assertEqual(acc.masked(), "TRAE CN")
         self.assertEqual(acc.to_dict()["device"], {"deviceId": "dev-1"})
+
+    def test_aes128_cbc_fips197_and_applog_envelope(self):
+        # NIST FIPS-197 Appendix B 精确测试向量
+        key = bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c")
+        pt = bytes.fromhex("3243f6a8885a308d313198a2e0370734")
+        expected_ct = bytes.fromhex("3925841d02dc09fbdc118597196a0b32")
+        rks = trae._aes128_expand_key(key)
+        self.assertEqual(trae._aes128_encrypt_block(pt, rks), expected_ct)
+
+        iv = bytes(range(16))
+        cbc = trae._aes128_cbc_encrypt(key, iv, b"hello-trae-cn-dr")
+        self.assertEqual(len(cbc), 32)  # 16 字节正文 + 16 字节 PKCS#7 填充
+        env = trae._tc_applog_encrypt(b"payload")
+        self.assertTrue(env.startswith(b"tc\x05\x10\x00\x00"))
+        self.assertGreater(len(env), 38 + 64)
 
     def test_p256_ecdsa_pkcs8_and_device_proof(self):
         d = 0x112233445566778899AABBCCDDEEFF01112233445566778899AABBCCDDEEFF01
@@ -343,18 +359,30 @@ class TraeCliAndWebIntegrationTests(unittest.TestCase):
                     }
                 )
 
-                started = app.do_trae_oauth_start("http://localhost:8787", name="TRAE-2号")
+                def fake_reg(method, url, headers=None, body=None, **kw):
+                    if "/service/2/desktop/device_register/" in url:
+                        self.assertIsInstance(body, (bytes, bytearray))
+                        self.assertTrue(bytes(body).startswith(b"tc\x05\x10\x00\x00"))
+                        return _resp({"device_id_str": "727256745387348", "install_id_str": "727256745391444"})
+                    if "/service/2/app_alert_check/" in url:
+                        return _resp({"message": "success"})
+                    raise AssertionError("unexpected start url: " + url)
+
+                with patch("wbsignin.httpc.request", side_effect=fake_reg):
+                    started = app.do_trae_oauth_start("http://localhost:8787", name="TRAE-2号")
                 tid = started["trace_id"]
                 parsed = urllib.parse.urlparse(started["auth_url"])
                 q = dict(urllib.parse.parse_qsl(parsed.query))
                 self.assertEqual(q["auth_callback_url"], "http://127.0.0.1:8787/authorize")
                 self.assertEqual(q["code_challenge_method"], "S256")
                 self.assertEqual(q["login_trace_id"], tid)
+                self.assertEqual(q["device_id"], "727256745387348")
 
                 def fake_req(method, url, headers=None, body=None, **kw):
                     if "/trae/api/v3/oauth/ExchangeToken" in url:
                         self.assertEqual(body["AuthCode"], "ac-xyz")
                         self.assertTrue(body["CodeVerifier"])
+                        self.assertEqual(body["DeviceInfo"]["DeviceID"], "727256745387348")
                         self.assertEqual(body["DeviceInfo"]["DevicePublicKey"], app._trae_oauth_sessions[tid]["device"]["publicKeyPEM"])
                         return _resp(
                             {
@@ -396,7 +424,59 @@ class TraeCliAndWebIntegrationTests(unittest.TestCase):
                 self.assertEqual(len(saved), 2)
                 self.assertIn("trae-cn:1001", saved)
                 self.assertIn("trae-cn:2002", saved)
-                self.assertNotEqual(saved["trae-cn:2002"]["device"]["deviceId"], "dev-111")
+                self.assertEqual(saved["trae-cn:2002"]["device"]["deviceId"], "727256745387348")
+                self.assertEqual(saved["trae-cn:2002"]["device"]["installId"], "727256745391444")
+
+    def test_runner_auto_heal_code_9074_registers_ug_device(self):
+        with tempfile.TemporaryDirectory() as d_dir:
+            home_dir = Path(d_dir)
+            with patch.dict("os.environ", {"WBSIGNIN_HOME": str(home_dir)}):
+                vault = Vault(home_dir / "vault.json", "pass-9074-test")
+                vault.save(
+                    {
+                        "version": 1,
+                        "accounts": {
+                            "trae-cn:2002": Account(
+                                phone="trae-cn:2002",
+                                provider="trae-cn",
+                                access_token="tok-2",
+                                uid="2002",
+                                label="TRAE-2号",
+                                at_exp=int(time.time()) + 86400,
+                                device={"deviceId": "orig-611000", "appVersion": "3.4.18", "osName": "win32"},
+                            ).to_dict()
+                        },
+                    }
+                )
+                seen_dids = []
+
+                def fake_req(method, url, headers=None, body=None, **kw):
+                    if "/checkin_credits/status" in url:
+                        return _resp({"code": 0, "enable": True, "checked_in": False, "credits": 100})
+                    if "/checkin_credits/claim" in url:
+                        did = (headers or {}).get("x-device-id")
+                        seen_dids.append(did)
+                        if did == "orig-611000":
+                            return _resp({"code": 9074, "message": "当前参与用户太多，请稍后再试"})
+                        self.assertEqual(did, "727256745387348")
+                        return _resp({"code": 0, "message": "success"})
+                    if "/service/2/desktop/device_register/" in url:
+                        return _resp({"device_id_str": "727256745387348", "install_id_str": "727256745391444"})
+                    if "/service/2/app_alert_check/" in url:
+                        return _resp({"message": "success"})
+                    if "/ide_user_ent_usage" in url:
+                        return _resp({"total_balance": 600, "user_entitlement_pack_list": []})
+                    raise AssertionError("unexpected url: " + url)
+
+                with patch("wbsignin.httpc.request", side_effect=fake_req):
+                    rep = runner.run(vault, want_credits=True, jobs=1)
+
+                self.assertEqual(rep.signed, 1)
+                self.assertEqual(seen_dids, ["orig-611000", "727256745387348"])
+                updated_dev = vault.load()["accounts"]["trae-cn:2002"]["device"]
+                self.assertEqual(updated_dev["deviceId"], "orig-611000")
+                self.assertEqual(updated_dev["ugDeviceId"], "727256745387348")
+                self.assertEqual(updated_dev["installId"], "727256745391444")
 
 
 if __name__ == "__main__":

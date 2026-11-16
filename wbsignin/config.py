@@ -42,6 +42,8 @@ QODER_CN_BASE = "https://openapi.qoder.com.cn"
 TRAE_CN_API_BASE = "https://api.trae.cn"
 TRAE_CN_LOGIN_CHECK_BASE = "https://api.trae.com.cn"
 TRAE_CN_WEB_ORIGIN = "https://www.trae.cn"
+TRAE_CN_DEVICE_REGISTER_URL = "https://log.snssdk.com/service/2/desktop/device_register/"
+TRAE_CN_DEVICE_ACTIVE_URL = "https://log.snssdk.com/service/2/app_alert_check/"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -60,6 +62,7 @@ ALLOWED_HOSTS = frozenset(
         "openapi.qoder.com.cn",
         "api.trae.cn",
         "api.trae.com.cn",
+        "log.snssdk.com",
     }
 )
 
