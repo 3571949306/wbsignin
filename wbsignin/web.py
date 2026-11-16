@@ -15,12 +15,15 @@
 from __future__ import annotations
 
 import datetime
+import html
 import json
 import os
 import re
+import secrets
 import subprocess
 import threading
 import time
+import urllib.parse
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -64,10 +67,30 @@ def _num(v) -> str:
 
 
 class App:
+    _SESSION_TTL = 600.0
+
     def __init__(self, vault: Vault, jobs: int = 0):
         self.vault = vault
         self.jobs = jobs
         self._credits: Dict[str, Any] = {}
+        self._login_lock = threading.Lock()
+        self._db_qr_sessions: Dict[str, Dict[str, Any]] = {}
+        self._trae_oauth_sessions: Dict[str, Dict[str, Any]] = {}
+
+    def _prune_sessions(self, store: Dict[str, Dict[str, Any]]) -> None:
+        now = time.time()
+        expired = [k for k, v in store.items() if now - v.get("created", 0) > self._SESSION_TTL]
+        for k in expired:
+            store.pop(k, None)
+
+    def _cache_upsert_credit(self, res: Dict[str, Any]) -> None:
+        snap = res.get("snap")
+        if snap and not snap.error:
+            self._credits[res["key"]] = {
+                "total": _num(snap.total_remain),
+                "lines": snap.lines(),
+                "paid": snap.is_paid,
+            }
 
     # ---------- 数据访问 ----------
     def _accounts(self) -> Dict[str, Any]:
@@ -354,6 +377,177 @@ class App:
             "credit": res.get("credit"),
         }
 
+    # ---------- 豆包无头扫码登录 ----------
+    def do_doubao_qr_start(self, name: str = "") -> Dict[str, Any]:
+        from . import doubao
+
+        started = doubao.qr_start()
+        sid = secrets.token_hex(16)
+        with self._login_lock:
+            self._prune_sessions(self._db_qr_sessions)
+            self._db_qr_sessions[sid] = {
+                "token": started["token"],
+                "jar": started["jar"],
+                "name": (name or "").strip(),
+                "created": time.time(),
+            }
+        return {
+            "session_id": sid,
+            "qrcode": started["qrcode"],
+            "expire_time": started.get("expire_time", 0),
+        }
+
+    def do_doubao_qr_poll(self, session_id: str, name: str = "") -> Dict[str, Any]:
+        from . import doubao
+
+        sid = str(session_id or "").strip()
+        with self._login_lock:
+            self._prune_sessions(self._db_qr_sessions)
+            sess = self._db_qr_sessions.get(sid)
+        if not sess:
+            return {"status": "expired", "error": "扫码会话已过期，请刷新二维码"}
+
+        polled = doubao.qr_poll(sess["token"], sess["jar"])
+        st = polled.get("status")
+        if st in ("new", "scanned"):
+            return {"status": st}
+        if st in ("refused", "expired", "error"):
+            with self._login_lock:
+                self._db_qr_sessions.pop(sid, None)
+            return {"status": st, "error": polled.get("error", "扫码失败")}
+        if st == "confirmed":
+            with self._login_lock:
+                self._db_qr_sessions.pop(sid, None)
+            eff_name = (name or "").strip() or sess.get("name", "")
+            res = upsert_doubao_account(
+                self.vault,
+                polled["cookie"],
+                name=eff_name,
+                default_name="豆包",
+            )
+            self._cache_upsert_credit(res)
+            _log("豆包账号 %s 扫码登录成功" % res["masked"])
+            return {
+                "status": "done",
+                "masked": res["masked"],
+                "continuous_days": res.get("continuous_days", 0),
+                "total_amount": res.get("total_amount", 0),
+            }
+        return {"status": "error", "error": "未知扫码状态"}
+
+    # ---------- TRAE CN 网页授权登录 ----------
+    def do_trae_oauth_start(self, origin: str, name: str = "") -> Dict[str, Any]:
+        from . import trae
+
+        sess = trae.oauth_start(origin, name=name)
+        trace_id = sess["trace_id"]
+        with self._login_lock:
+            self._prune_sessions(self._trae_oauth_sessions)
+            self._trae_oauth_sessions[trace_id] = {
+                "status": "pending",
+                "code_verifier": sess["code_verifier"],
+                "device": sess["device"],
+                "name": sess["name"],
+                "created": time.time(),
+            }
+        return {"trace_id": trace_id, "auth_url": sess["auth_url"]}
+
+    def do_trae_oauth_status(self, trace_id: str) -> Dict[str, Any]:
+        tid = str(trace_id or "").strip()
+        with self._login_lock:
+            self._prune_sessions(self._trae_oauth_sessions)
+            sess = self._trae_oauth_sessions.get(tid)
+            if not sess:
+                return {"status": "expired", "error": "授权会话已过期，请重新发起"}
+            out: Dict[str, Any] = {"status": sess["status"]}
+            if sess["status"] == "done" and isinstance(sess.get("result"), dict):
+                out.update(sess["result"])
+            elif sess["status"] == "error":
+                out["error"] = sess.get("error", "授权失败")
+            return out
+
+    def do_trae_oauth_callback(self, query_str: str) -> str:
+        from . import trae
+
+        qs = urllib.parse.parse_qs(query_str or "", keep_blank_values=True)
+        trace_id = (qs.get("loginTraceID") or qs.get("login_trace_id") or [""])[0].strip()
+        with self._login_lock:
+            self._prune_sessions(self._trae_oauth_sessions)
+            sess = self._trae_oauth_sessions.get(trace_id)
+            if not sess or sess.get("status") != "pending":
+                return _oauth_result_html(False, "授权会话无效或已过期", "请返回 wbsignin 控制台重新发起授权。", "")
+            sess["status"] = "processing"
+
+        auth_code = ""
+        raw_info = (qs.get("authCodeInfo") or [""])[0].strip()
+        if raw_info:
+            try:
+                parsed = json.loads(raw_info)
+                if isinstance(parsed, dict):
+                    auth_code = str(parsed.get("AuthCode") or parsed.get("authCode") or "").strip()
+            except ValueError:
+                pass
+        if not auth_code:
+            auth_code = (qs.get("AuthCode") or qs.get("code") or [""])[0].strip()
+
+        if not auth_code:
+            err_msg = (qs.get("error_msg") or qs.get("error_code") or ["未收到 AuthCode"])[0]
+            with self._login_lock:
+                sess["status"] = "error"
+                sess["error"] = "授权未完成：%s" % err_msg
+            return _oauth_result_html(False, "TRAE CN 授权未完成", str(err_msg), trace_id)
+
+        try:
+            exchanged = trae.exchange_auth_code(
+                auth_code,
+                sess["code_verifier"],
+                sess["device"],
+                host=(qs.get("host") or [""])[0],
+            )
+            res = upsert_trae_account(self.vault, exchanged, name=sess.get("name", ""))
+            self._cache_upsert_credit(res)
+            with self._login_lock:
+                sess["status"] = "done"
+                sess["result"] = {"masked": res["masked"], "credit": res.get("credit")}
+            _log("TRAE CN 账号 %s 网页授权成功" % res["masked"])
+            credit_txt = "（剩余 %s 积分）" % res["credit"] if res.get("credit") is not None else ""
+            return _oauth_result_html(
+                True,
+                "TRAE CN 授权成功",
+                "账号 %s 已添加到服务器%s，可关闭此页面。" % (res["masked"], credit_txt),
+                trace_id,
+            )
+        except Exception as exc:
+            detail = exc.detail if isinstance(exc, httpc.ApiError) else str(exc)[:200]
+            with self._login_lock:
+                sess["status"] = "error"
+                sess["error"] = detail
+            return _oauth_result_html(False, "TRAE CN 导入失败", detail, trace_id)
+
+
+def _oauth_result_html(ok: bool, title: str, detail: str, trace_id: str) -> str:
+    msg_json = json.dumps({"type": "wbsignin-trae-oauth", "ok": ok, "trace_id": trace_id})
+    color = "#3fb96f" if ok else "#e5534b"
+    icon = "✓" if ok else "✕"
+    close_btn = (
+        '<button onclick="window.close()" style="margin-top:18px;padding:9px 20px;border:none;'
+        'border-radius:8px;background:#4f7cff;color:#fff;cursor:pointer;font-size:14px">关闭窗口</button>'
+    )
+    return (
+        "<!DOCTYPE html><html lang='zh-CN'><head><meta charset='utf-8'>"
+        "<title>%s</title></head>"
+        "<body style='margin:0;background:#101014;color:#e6e6eb;font:15px/1.6 -apple-system,Segoe UI,sans-serif;"
+        "display:flex;align-items:center;justify-content:center;min-height:100vh'>"
+        "<div style='background:#17171c;border:1px solid #2a2a33;border-radius:12px;padding:28px 32px;"
+        "max-width:420px;text-align:center'>"
+        "<div style='font-size:32px;color:%s;margin-bottom:8px'>%s</div>"
+        "<h2 style='margin:0 0 8px;font-size:18px'>%s</h2>"
+        "<p style='margin:0;color:#9a9aa5;font-size:13px'>%s</p>%s</div>"
+        "<script>try{if(window.opener){window.opener.postMessage(%s,'*');}}catch(e){}</script>"
+        "</body></html>"
+        % (html.escape(title), color, icon, html.escape(title), html.escape(detail), close_btn, msg_json)
+    )
+
 
 def _mask(phone: str) -> str:
     return (phone[:3] + "****" + phone[-4:]) if len(phone) >= 8 else phone
@@ -456,13 +650,18 @@ class Handler(BaseHTTPRequestHandler):
         if not self._is_local():
             self.send_error(403)
             return
-        path = self.path.split("?", 1)[0]
+        path, _, query = self.path.partition("?")
         if path in ("/", "/index.html"):
             _send_html(self, _INDEX)
         elif path == "/api/state":
             _send(self, _app_ctx().state())
         elif path == "/api/log":
             _send(self, {"lines": list(_LOG)})
+        elif path == "/api/trae-oauth/status":
+            tid = (urllib.parse.parse_qs(query).get("trace_id") or [""])[0]
+            _send(self, _app_ctx().do_trae_oauth_status(tid))
+        elif path == "/authorize":
+            _send_html(self, _app_ctx().do_trae_oauth_callback(query))
         else:
             self.send_error(404)
 
@@ -491,6 +690,16 @@ class Handler(BaseHTTPRequestHandler):
                 cookie = str(body.get("cookie") or "").strip()
                 name = str(body.get("name") or "").strip()
                 _send(self, app.do_login_doubao(cookie, name))
+            elif path == "/api/doubao-qr/start":
+                _send(self, app.do_doubao_qr_start(name=str(body.get("name") or "").strip()))
+            elif path == "/api/doubao-qr/poll":
+                _send(
+                    self,
+                    app.do_doubao_qr_poll(
+                        session_id=str(body.get("session_id") or "").strip(),
+                        name=str(body.get("name") or "").strip(),
+                    ),
+                )
             elif path == "/api/login-qoder":
                 _send(
                     self,
@@ -514,6 +723,14 @@ class Handler(BaseHTTPRequestHandler):
                         device=body.get("device"),
                         uid=str(body.get("uid") or ""),
                         expires_at=body.get("expires_at") or body.get("expiresAt") or body.get("expiredAt"),
+                    ),
+                )
+            elif path == "/api/trae-oauth/start":
+                _send(
+                    self,
+                    app.do_trae_oauth_start(
+                        origin=str(body.get("origin") or "").strip(),
+                        name=str(body.get("name") or "").strip(),
                     ),
                 )
             elif path == "/api/remove":

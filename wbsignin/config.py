@@ -26,6 +26,8 @@ DOUBAO_LANDING_GET_URL = "https://www.doubao.com/alice/ug/campaign/landing/get"
 DOUBAO_CHECKIN_URL = "https://www.doubao.com/alice/ug/campaign/landing/checkin"
 DOUBAO_QUOTA_RECORDS_URL = "https://www.doubao.com/alice/ug/campaign/quota/records/"
 DOUBAO_OVERVIEW_URL = "https://www.doubao.com/alice/commerce/sale/subscription/overview/"
+DOUBAO_PASSPORT_QRCODE_URL = "https://accounts.doubao.com/passport/web/get_qrcode/"
+DOUBAO_PASSPORT_CHECK_URL = "https://accounts.doubao.com/passport/web/check_qrconnect/"
 
 
 def doubao_proxy() -> str:
@@ -39,6 +41,7 @@ QODER_CN_BASE = "https://openapi.qoder.com.cn"
 # TRAE CN（trae.cn）
 TRAE_CN_API_BASE = "https://api.trae.cn"
 TRAE_CN_LOGIN_CHECK_BASE = "https://api.trae.com.cn"
+TRAE_CN_WEB_ORIGIN = "https://www.trae.cn"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -52,6 +55,7 @@ ALLOWED_HOSTS = frozenset(
         "copilot.tencent.com",
         "www.codebuddy.cn",
         "www.doubao.com",
+        "accounts.doubao.com",
         "openapi.qoder.sh",
         "openapi.qoder.com.cn",
         "api.trae.cn",

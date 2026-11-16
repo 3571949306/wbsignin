@@ -13,8 +13,11 @@ import base64
 import datetime
 import hashlib
 import hmac
+import re
 import secrets
 import time
+import urllib.parse
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import config, httpc
@@ -196,6 +199,44 @@ def build_device_proof(
     return {"Signature": sig, "Timestamp": ts, "Nonce": n}
 
 
+def _pem_block(kind: str, der: bytes) -> str:
+    b64 = base64.b64encode(der).decode("ascii")
+    lines = [b64[i : i + 64] for i in range(0, len(b64), 64)]
+    return f"-----BEGIN {kind}-----\n" + "\n".join(lines) + f"\n-----END {kind}-----\n"
+
+
+def generate_p256_keypair() -> Tuple[str, str]:
+    """纯标准库生成 NIST P-256 PKCS#8 私钥 + SPKI 公钥 PEM（供远端 OAuth 注册设备）。"""
+    d = secrets.randbelow(_P256_N - 1) + 1
+    pt = _ec_mul(d)
+    assert pt is not None
+    pub_uncomp = b"\x04" + pt[0].to_bytes(32, "big") + pt[1].to_bytes(32, "big")
+    oid_ecpub = b"\x06\x07\x2a\x86\x48\xce\x3d\x02\x01"
+    oid_p256 = b"\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07"
+    alg_id = b"\x30" + bytes([len(oid_ecpub) + len(oid_p256)]) + oid_ecpub + oid_p256
+    bitstr = b"\x03" + bytes([len(pub_uncomp) + 1]) + b"\x00" + pub_uncomp
+    spki_body = alg_id + bitstr
+    spki = b"\x30" + bytes([len(spki_body)]) + spki_body
+
+    priv_b = d.to_bytes(32, "big")
+    ec_body = (
+        b"\x02\x01\x01\x04\x20"
+        + priv_b
+        + b"\xa0"
+        + bytes([len(oid_p256)])
+        + oid_p256
+        + b"\xa1"
+        + bytes([len(bitstr)])
+        + bitstr
+    )
+    ec_priv = b"\x30" + bytes([len(ec_body)]) + ec_body
+    p8_body = b"\x02\x01\x00" + alg_id + b"\x04" + bytes([len(ec_priv)]) + ec_priv
+    p8_hdr = b"\x30" + (
+        bytes([0x81, len(p8_body)]) if len(p8_body) >= 128 else bytes([len(p8_body)])
+    )
+    return _pem_block("PRIVATE KEY", p8_hdr + p8_body), _pem_block("PUBLIC KEY", spki)
+
+
 # ---------- 登录校验与续期 ----------
 def verify_token(
     token: str, device: Optional[Dict[str, Any]] = None
@@ -262,26 +303,9 @@ def needs_refresh(
     return at_exp - int(time.time()) <= threshold_seconds
 
 
-def refresh_session(
-    refresh_token: str,
-    access_token: str = "",
-    device: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """调用 /trae/api/v3/oauth/ExchangeToken 续期（需持有设备 P-256 私钥）。"""
-    rt = str(refresh_token or "").strip()
-    dev = device if isinstance(device, dict) else {}
-    priv = str(dev.get("privateKeyPEM") or "").strip()
-    pub = str(dev.get("publicKeyPEM") or "").strip()
-    if not rt or not priv or not pub:
-        raise httpc.ApiError(
-            httpc.KIND_AUTH,
-            "缺少 RefreshToken 或设备 P-256 密钥，需在本机重新导入 TRAE CN 凭据",
-        )
-
-    client_id = str(dev.get("clientId") or DEFAULT_CLIENT_ID)
+def _build_device_info(dev: Dict[str, Any], pub: str) -> Dict[str, Any]:
     ver = str(dev.get("appVersion") or DEFAULT_APP_VERSION)
-    proof = build_device_proof(priv, client_id, rt)
-    dev_info = {
+    return {
         "DeviceID": str(dev.get("deviceId") or ""),
         "MachineID": str(dev.get("machineId") or ""),
         "PlatformCode": "IDE_PC",
@@ -295,22 +319,19 @@ def refresh_session(
         "OSInfo": str(dev.get("osName") or "win32"),
         "OSVersion": str(dev.get("osVersion") or ""),
     }
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    if access_token:
-        headers["x-cloudide-token"] = access_token
 
+
+def _exchange_token_call(
+    dev: Dict[str, Any],
+    body: Dict[str, Any],
+    headers: Dict[str, str],
+    fallback_rt: str = "",
+) -> Dict[str, Any]:
     resp = httpc.request(
         "POST",
         _api_base(dev) + _EXCHANGE_TOKEN_PATH,
         headers=headers,
-        body={
-            "ClientID": client_id,
-            "ClientSecret": "",
-            "RefreshToken": rt,
-            "DeviceInfo": dev_info,
-            "DeviceProof": proof,
-            "IDEVersion": ver,
-        },
+        body=body,
         retries=1,
     )
     payload = resp.payload if isinstance(resp.payload, dict) else {}
@@ -320,7 +341,7 @@ def refresh_session(
     if resp.status in (401, 403) or err_code in _RT_INVALID_CODES:
         raise httpc.ApiError(
             httpc.KIND_AUTH,
-            "TRAE CN 续期失败（RefreshToken 已失效：%s），请重新运行 pull_trae_cred.py 同步"
+            "TRAE CN OAuth 凭据无效或已过期（%s）"
             % (err_code or ("HTTP %s" % resp.status)),
             resp.status,
             payload,
@@ -329,11 +350,11 @@ def refresh_session(
     if resp.status >= 400 or not new_at:
         raise httpc.ApiError(
             httpc.KIND_SERVER,
-            "TRAE CN 续期响应异常（HTTP %s）" % resp.status,
+            "TRAE CN ExchangeToken 响应异常（HTTP %s）" % resp.status,
             resp.status,
             payload,
         )
-    new_rt = str(res.get("RefreshToken") or rt).strip()
+    new_rt = str(res.get("RefreshToken") or fallback_rt).strip()
     exp_ts = parse_expires_at(res.get("TokenExpireAt"))
     if not exp_ts and res.get("TokenExpireDuration"):
         exp_ts = int(time.time()) + int(_as_float(res["TokenExpireDuration"]) / 1000)
@@ -342,6 +363,150 @@ def refresh_session(
         "refresh_token": new_rt,
         "at_exp": exp_ts,
         "refresh_exp": parse_expires_at(res.get("RefreshExpireAt")),
+    }
+
+
+def refresh_session(
+    refresh_token: str,
+    access_token: str = "",
+    device: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """调用 /trae/api/v3/oauth/ExchangeToken 续期（需持有设备 P-256 私钥）。"""
+    rt = str(refresh_token or "").strip()
+    dev = device if isinstance(device, dict) else {}
+    priv = str(dev.get("privateKeyPEM") or "")
+    pub = str(dev.get("publicKeyPEM") or "")
+    if not rt or not priv.strip() or not pub.strip():
+        raise httpc.ApiError(
+            httpc.KIND_AUTH,
+            "缺少 RefreshToken 或设备 P-256 密钥，需在本机重新导入 TRAE CN 凭据",
+        )
+
+    client_id = str(dev.get("clientId") or DEFAULT_CLIENT_ID)
+    ver = str(dev.get("appVersion") or DEFAULT_APP_VERSION)
+    proof = build_device_proof(priv, client_id, rt)
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if access_token:
+        headers["x-cloudide-token"] = access_token
+
+    return _exchange_token_call(
+        dev,
+        {
+            "ClientID": client_id,
+            "ClientSecret": "",
+            "RefreshToken": rt,
+            "DeviceInfo": _build_device_info(dev, pub),
+            "DeviceProof": proof,
+            "IDEVersion": ver,
+        },
+        headers,
+        fallback_rt=rt,
+    )
+
+
+def oauth_start(callback_origin: str, name: str = "") -> Dict[str, Any]:
+    """生成 TRAE CN PKCE 网页授权会话与独立设备密钥，回调指向 127.0.0.1:<port>/authorize。"""
+    m = re.match(r"^https?://(127\.0\.0\.1|localhost):(\d+)$", (callback_origin or "").strip())
+    if not m:
+        raise httpc.ApiError(
+            httpc.KIND_BAD_RESPONSE,
+            "无效的本机回调地址（需为 http://127.0.0.1:<端口>）",
+        )
+    port = m.group(2)
+    callback_url = f"http://127.0.0.1:{port}/authorize"
+
+    trace_id = str(uuid.uuid4())
+    code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode("ascii")
+    code_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    device_id = str(secrets.randbelow(9) + 1) + "".join(
+        str(secrets.randbelow(10)) for _ in range(15)
+    )
+    machine_id = secrets.token_hex(32)
+    priv_pem, pub_pem = generate_p256_keypair()
+
+    dev = {
+        "deviceId": device_id,
+        "machineId": machine_id,
+        "appVersion": DEFAULT_APP_VERSION,
+        "clientId": DEFAULT_CLIENT_ID,
+        "osName": "win32",
+        "deviceName": "wbsignin-" + secrets.token_hex(3),
+        "apiHost": config.TRAE_CN_API_BASE,
+        "privateKeyPEM": priv_pem,
+        "publicKeyPEM": pub_pem,
+    }
+    params = {
+        "login_version": "1",
+        "auth_from": "trae",
+        "login_channel": "native_ide",
+        "plugin_version": "local",
+        "auth_type": "local",
+        "client_id": DEFAULT_CLIENT_ID,
+        "redirect": "0",
+        "login_trace_id": trace_id,
+        "auth_callback_url": callback_url,
+        "machine_id": machine_id,
+        "device_id": device_id,
+        "x_device_id": device_id,
+        "x_machine_id": machine_id,
+        "x_device_type": "win32",
+        "x_app_version": DEFAULT_APP_VERSION,
+        "x_app_type": "stable",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    auth_url = config.TRAE_CN_WEB_ORIGIN + "/authorization?" + urllib.parse.urlencode(params)
+    return {
+        "trace_id": trace_id,
+        "auth_url": auth_url,
+        "code_verifier": code_verifier,
+        "device": dev,
+        "name": (name or "").strip(),
+    }
+
+
+def exchange_auth_code(
+    auth_code: str,
+    code_verifier: str,
+    device: Optional[Dict[str, Any]] = None,
+    host: str = "",
+) -> Dict[str, Any]:
+    """用 OAuth 回调收到的 AuthCode + PKCE CodeVerifier 兑换 Token 与 RefreshToken。"""
+    code = str(auth_code or "").strip()
+    verifier = str(code_verifier or "").strip()
+    dev = dict(device) if isinstance(device, dict) else {}
+    pub = str(dev.get("publicKeyPEM") or "")
+    if not code or not verifier or not pub.strip():
+        raise httpc.ApiError(httpc.KIND_AUTH, "OAuth 授权参数缺失（AuthCode / CodeVerifier）")
+
+    if host:
+        h_name = urllib.parse.urlsplit(host).hostname or ""
+        if h_name in config.ALLOWED_HOSTS and host.startswith("https://"):
+            dev["apiHost"] = host.rstrip("/")
+
+    client_id = str(dev.get("clientId") or DEFAULT_CLIENT_ID)
+    ver = str(dev.get("appVersion") or DEFAULT_APP_VERSION)
+    res = _exchange_token_call(
+        dev,
+        {
+            "ClientID": client_id,
+            "AuthCode": code,
+            "CodeVerifier": verifier,
+            "DeviceInfo": _build_device_info(dev, pub),
+            "IDEVersion": ver,
+        },
+        {"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    return {
+        "provider": PROVIDER_CN,
+        "token": res["access_token"],
+        "refresh_token": res["refresh_token"],
+        "expires_at": res["at_exp"],
+        "device": dev,
     }
 
 

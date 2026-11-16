@@ -78,6 +78,14 @@
   .row { display: flex; gap: 8px; }
   .row input { flex: 1; }
   .err { color: var(--bad); font-size: 12px; margin-top: 10px; min-height: 16px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; line-height: 1.5; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 12px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+  .tab { background: transparent; color: var(--muted); border: 1px solid transparent; padding: 5px 10px; font-size: 12px; border-radius: 6px; }
+  .tab.active { background: var(--panel-2); color: var(--text); border-color: var(--border); }
+  .qr-wrap { text-align: center; padding: 12px 0 4px; }
+  .qr-box { display: inline-block; background: #fff; padding: 10px; border-radius: 10px; min-width: 176px; min-height: 176px; }
+  .qr-box img { display: block; width: 156px; height: 156px; }
+  .qr-st { font-size: 12px; color: var(--muted); margin-top: 8px; min-height: 18px; }
   .modal-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
 </style>
 </head>
@@ -136,16 +144,32 @@
 </dialog>
 
 <dialog id="add-db-dlg">
-  <h3>添加豆包账号（粘贴 Cookie）</h3>
-  <label>账号名称（用于区分，如「豆包主号」）</label>
-  <input id="in-db-name" placeholder="豆包主号">
-  <label>doubao.com 会话 Cookie</label>
-  <textarea id="in-db-cookie" rows="4" placeholder="浏览器打开 doubao.com 并登录后，F12 → Network → 任意请求 → 复制 Cookie 请求头的值" style="width:100%;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;resize:vertical"></textarea>
-  <div class="hint">仅个人账号有「每日签到」；工作版/飞书企业账号无此玩法。</div>
-  <div class="err" id="add-db-err"></div>
-  <div class="modal-foot">
-    <button id="btn-db-cancel" class="ghost">取消</button>
-    <button id="btn-db-confirm">确认添加</button>
+  <h3>添加豆包账号</h3>
+  <div class="tabs">
+    <button type="button" class="tab active" data-pane="db-pane-qr">扫码登录（推荐）</button>
+    <button type="button" class="tab" data-pane="db-pane-cookie">粘贴 Cookie</button>
+  </div>
+  <label>账号名称（可选，如「豆包主号」）</label>
+  <input id="in-db-name" placeholder="豆包主号（可选）">
+  <div id="db-pane-qr" class="tab-pane">
+    <div class="qr-wrap">
+      <div class="qr-box"><img id="db-qr-img" alt="豆包扫码登录二维码"></div>
+      <div class="qr-st" id="db-qr-status">正在获取二维码…</div>
+    </div>
+    <div class="modal-foot">
+      <button type="button" id="btn-db-qr-refresh" class="ghost">刷新二维码</button>
+      <button type="button" id="btn-db-qr-close" class="ghost">关闭</button>
+    </div>
+  </div>
+  <div id="db-pane-cookie" class="tab-pane" style="display:none">
+    <label>doubao.com 会话 Cookie</label>
+    <textarea id="in-db-cookie" rows="4" placeholder="浏览器打开 doubao.com 并登录后，F12 → Network → 任意请求 → 复制 Cookie 请求头的值" style="width:100%;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;resize:vertical"></textarea>
+    <div class="hint">仅个人账号有「每日签到」；工作版/飞书企业账号无此玩法。</div>
+    <div class="err" id="add-db-err"></div>
+    <div class="modal-foot">
+      <button type="button" id="btn-db-cancel" class="ghost">取消</button>
+      <button type="button" id="btn-db-confirm">确认添加</button>
+    </div>
   </div>
 </dialog>
 
@@ -170,15 +194,35 @@
 
 <dialog id="add-trae-dlg">
   <h3>添加 TRAE CN 账号（trae.cn）</h3>
+  <div class="tabs">
+    <button type="button" class="tab active" data-pane="trae-pane-oauth">网页授权登录（推荐）</button>
+    <button type="button" class="tab" data-pane="trae-pane-json">粘贴 JSON / Token</button>
+  </div>
   <label>账号名称（可选，如「TRAE 主号」）</label>
   <input id="in-trae-name" placeholder="TRAE CN（可选）">
-  <label>凭据 JSON（或 Cloud-IDE-JWT Token）</label>
-  <textarea id="in-trae-token" rows="4" placeholder="推荐使用 python tools/pull_trae_cred.py --json 输出的完整 JSON（含刷新密钥）" style="width:100%;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;resize:vertical"></textarea>
-  <div class="hint">导入完整 JSON 后可在服务器每日自动签到并在令牌临期时自动续期。</div>
-  <div class="err" id="add-trae-err"></div>
-  <div class="modal-foot">
-    <button id="btn-trae-cancel" class="ghost">取消</button>
-    <button id="btn-trae-confirm">确认添加</button>
+  <div id="trae-pane-oauth" class="tab-pane">
+    <div class="hint">
+      点击下方按钮将打开官方 <b>www.trae.cn</b> 授权页（支持微信/手机/扫码，且可点「使用其他账号登录」添加多个小号）；每个号会自动分配独立设备指纹与 P-256 续期密钥。
+    </div>
+    <div class="qr-st" id="trae-oauth-status" style="margin-top:12px"></div>
+    <div id="trae-oauth-link-wrap" style="margin-top:8px;display:none;font-size:12px">
+      若浏览器拦截弹窗，请手动点击：<a id="trae-oauth-link" href="#" target="_blank" rel="noopener" style="color:var(--accent)">打开 TRAE CN 授权页</a>
+    </div>
+    <div class="err" id="add-trae-oauth-err"></div>
+    <div class="modal-foot">
+      <button type="button" id="btn-trae-oauth-cancel" class="ghost">关闭</button>
+      <button type="button" id="btn-trae-oauth">打开 TRAE CN 授权页</button>
+    </div>
+  </div>
+  <div id="trae-pane-json" class="tab-pane" style="display:none">
+    <label>凭据 JSON（或 Cloud-IDE-JWT Token）</label>
+    <textarea id="in-trae-token" rows="4" placeholder="推荐使用 python tools/pull_trae_cred.py --json 输出的完整 JSON（含刷新密钥）" style="width:100%;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;resize:vertical"></textarea>
+    <div class="hint">导入完整 JSON 后可在服务器每日自动签到并在令牌临期时自动续期。</div>
+    <div class="err" id="add-trae-err"></div>
+    <div class="modal-foot">
+      <button type="button" id="btn-trae-cancel" class="ghost">取消</button>
+      <button type="button" id="btn-trae-confirm">确认添加</button>
+    </div>
   </div>
 </dialog>
 
@@ -339,9 +383,71 @@ $('#btn-confirm').onclick = async () => {
   finally { busy($('#btn-confirm'), false); }
 };
 
-// ---- 添加豆包 ----
+function switchTab(dlg, paneId) {
+  dlg.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.pane === paneId));
+  dlg.querySelectorAll('.tab-pane').forEach(p => { p.style.display = p.id === paneId ? '' : 'none'; });
+}
+function bindTabs(dlg, onSwitch) {
+  dlg.querySelectorAll('.tab').forEach(b => {
+    b.onclick = () => { switchTab(dlg, b.dataset.pane); if (onSwitch) onSwitch(b.dataset.pane); };
+  });
+}
+
+// ---- 添加豆包（扫码 / Cookie） ----
 const dbDlg = $('#add-db-dlg');
-$('#btn-add-db').onclick = () => { $('#add-db-err').textContent = ''; dbDlg.showModal(); };
+let dbQrSid = '', dbQrTimer = null;
+function stopDbQr() { if (dbQrTimer) { clearInterval(dbQrTimer); dbQrTimer = null; } }
+async function startDbQr() {
+  stopDbQr();
+  dbQrSid = '';
+  $('#db-qr-img').removeAttribute('src');
+  $('#db-qr-status').textContent = '正在获取二维码…';
+  $('#db-qr-status').style.color = '';
+  try {
+    const r = await post('/api/doubao-qr/start', { name: $('#in-db-name').value.trim() });
+    dbQrSid = r.session_id;
+    $('#db-qr-img').src = r.qrcode;
+    $('#db-qr-status').textContent = '请使用手机豆包 App 扫码登录';
+    dbQrTimer = setInterval(pollDbQr, 1500);
+  } catch (e) {
+    $('#db-qr-status').textContent = '获取失败：' + e.message;
+    $('#db-qr-status').style.color = 'var(--bad)';
+  }
+}
+async function pollDbQr() {
+  if (!dbQrSid || !dbDlg.open) return;
+  try {
+    const r = await post('/api/doubao-qr/poll', { session_id: dbQrSid, name: $('#in-db-name').value.trim() });
+    if (r.status === 'new') {
+      $('#db-qr-status').textContent = '请使用手机豆包 App 扫码登录';
+    } else if (r.status === 'scanned') {
+      $('#db-qr-status').textContent = '已扫码，请在手机端确认授权…';
+      $('#db-qr-status').style.color = 'var(--warn)';
+    } else if (r.status === 'done') {
+      stopDbQr();
+      dbDlg.close();
+      await refresh();
+    } else {
+      stopDbQr();
+      $('#db-qr-status').textContent = r.error || '二维码已失效，请点击刷新';
+      $('#db-qr-status').style.color = 'var(--bad)';
+    }
+  } catch (e) {
+    stopDbQr();
+    $('#db-qr-status').textContent = '登录失败：' + e.message;
+    $('#db-qr-status').style.color = 'var(--bad)';
+  }
+}
+bindTabs(dbDlg, pane => { if (pane === 'db-pane-qr') startDbQr(); else stopDbQr(); });
+dbDlg.onclose = stopDbQr;
+$('#btn-add-db').onclick = () => {
+  $('#add-db-err').textContent = '';
+  switchTab(dbDlg, 'db-pane-qr');
+  dbDlg.showModal();
+  startDbQr();
+};
+$('#btn-db-qr-refresh').onclick = startDbQr;
+$('#btn-db-qr-close').onclick = () => dbDlg.close();
 $('#btn-db-cancel').onclick = () => dbDlg.close();
 
 $('#btn-db-confirm').onclick = async () => {
@@ -378,10 +484,60 @@ $('#btn-qoder-confirm').onclick = async () => {
   finally { busy($('#btn-qoder-confirm'), false); }
 };
 
-// ---- 添加 TRAE CN ----
+// ---- 添加 TRAE CN（网页 OAuth / 手动导入） ----
 const traeDlg = $('#add-trae-dlg');
-$('#btn-add-trae').onclick = () => { $('#add-trae-err').textContent = ''; traeDlg.showModal(); };
+let traeTraceId = '', traeOAuthTimer = null;
+function stopTraePoll() { if (traeOAuthTimer) { clearInterval(traeOAuthTimer); traeOAuthTimer = null; } }
+async function pollTraeOAuth() {
+  if (!traeTraceId || !traeDlg.open) return;
+  try {
+    const r = await get('/api/trae-oauth/status?trace_id=' + encodeURIComponent(traeTraceId));
+    if (r.status === 'done') {
+      stopTraePoll();
+      traeDlg.close();
+      await refresh();
+    } else if (r.status === 'error' || r.status === 'expired') {
+      stopTraePoll();
+      $('#add-trae-oauth-err').textContent = r.error || '授权失败，请重试';
+      $('#trae-oauth-status').textContent = '';
+    }
+  } catch (e) { /* 忽略瞬时轮询错误 */ }
+}
+bindTabs(traeDlg, pane => { if (pane !== 'trae-pane-oauth') stopTraePoll(); });
+traeDlg.onclose = stopTraePoll;
+window.addEventListener('message', ev => {
+  if (ev.data && ev.data.type === 'wbsignin-trae-oauth' && ev.data.trace_id === traeTraceId) pollTraeOAuth();
+});
+$('#btn-add-trae').onclick = () => {
+  $('#add-trae-err').textContent = '';
+  $('#add-trae-oauth-err').textContent = '';
+  $('#trae-oauth-status').textContent = '';
+  $('#trae-oauth-link-wrap').style.display = 'none';
+  switchTab(traeDlg, 'trae-pane-oauth');
+  traeDlg.showModal();
+};
+$('#btn-trae-oauth-cancel').onclick = () => traeDlg.close();
 $('#btn-trae-cancel').onclick = () => traeDlg.close();
+
+$('#btn-trae-oauth').onclick = async () => {
+  $('#add-trae-oauth-err').textContent = '';
+  stopTraePoll();
+  busy($('#btn-trae-oauth'), true, '生成授权链接…');
+  try {
+    const origin = location.protocol + '//' + (location.hostname === 'localhost' ? '127.0.0.1' : location.hostname) + (location.port ? ':' + location.port : ':80');
+    const r = await post('/api/trae-oauth/start', { origin, name: $('#in-trae-name').value.trim() });
+    traeTraceId = r.trace_id;
+    $('#trae-oauth-link').href = r.auth_url;
+    $('#trae-oauth-link-wrap').style.display = 'block';
+    $('#trae-oauth-status').textContent = '请在打开的 trae.cn 页面完成登录并点击授权，正在等待回调…';
+    window.open(r.auth_url, '_blank');
+    traeOAuthTimer = setInterval(pollTraeOAuth, 1500);
+  } catch (e) {
+    $('#add-trae-oauth-err').textContent = '发起失败：' + e.message;
+  } finally {
+    busy($('#btn-trae-oauth'), false);
+  }
+};
 
 $('#btn-trae-confirm').onclick = async () => {
   const name = $('#in-trae-name').value.trim();

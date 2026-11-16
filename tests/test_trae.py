@@ -310,6 +310,94 @@ class TraeCliAndWebIntegrationTests(unittest.TestCase):
                     self.assertEqual(len(saved), 1)
                     self.assertIn("trae-cn:2068001", saved)
 
+    def test_generate_p256_keypair_and_oauth_multi_account_callback(self):
+        import urllib.parse
+
+        priv, pub = trae.generate_p256_keypair()
+        self.assertIn("BEGIN PRIVATE KEY", priv)
+        self.assertIn("BEGIN PUBLIC KEY", pub)
+        d = trae._parse_pkcs8_ec_privkey(priv)
+        msg = b"POST\n/trae/api/v3/oauth/ExchangeToken\ncid\nrt\n1700000000\nn"
+        self.assertTrue(_verify_p256_der(d, msg, trae.sign_p256_sha256(priv, msg)))
+
+        with self.assertRaises(httpc.ApiError):
+            trae.oauth_start("https://evil.example.com:8787")
+
+        with tempfile.TemporaryDirectory() as d_dir:
+            home_dir = Path(d_dir)
+            with patch.dict("os.environ", {"WBSIGNIN_HOME": str(home_dir)}):
+                vault = Vault(home_dir / "vault.json", "pass-oauth-123")
+                app = App(vault)
+
+                # 先模拟已存在一个主号，验证网页授权能追加第 2 个小号并带独立 deviceId
+                vault.save(
+                    {
+                        "version": 1,
+                        "accounts": {
+                            "trae-cn:1001": Account(
+                                phone="trae-cn:1001", provider="trae-cn",
+                                access_token="tok-1", uid="1001", label="TRAE-1",
+                                device={"deviceId": "dev-111"},
+                            ).to_dict()
+                        },
+                    }
+                )
+
+                started = app.do_trae_oauth_start("http://localhost:8787", name="TRAE-2号")
+                tid = started["trace_id"]
+                parsed = urllib.parse.urlparse(started["auth_url"])
+                q = dict(urllib.parse.parse_qsl(parsed.query))
+                self.assertEqual(q["auth_callback_url"], "http://127.0.0.1:8787/authorize")
+                self.assertEqual(q["code_challenge_method"], "S256")
+                self.assertEqual(q["login_trace_id"], tid)
+
+                def fake_req(method, url, headers=None, body=None, **kw):
+                    if "/trae/api/v3/oauth/ExchangeToken" in url:
+                        self.assertEqual(body["AuthCode"], "ac-xyz")
+                        self.assertTrue(body["CodeVerifier"])
+                        self.assertEqual(body["DeviceInfo"]["DevicePublicKey"], app._trae_oauth_sessions[tid]["device"]["publicKeyPEM"])
+                        return _resp(
+                            {
+                                "Result": {
+                                    "Token": "tok-2",
+                                    "RefreshToken": "rt-2",
+                                    "TokenExpireAt": "2026-12-01T00:00:00Z",
+                                    "RefreshExpireAt": "2027-06-01T00:00:00Z",
+                                }
+                            }
+                        )
+                    if "/trae/GetUserInfo" in url:
+                        return _resp({"Result": {"UserID": "2002", "NonPlainTextMobile": "139******88", "AIRegion": "CN"}})
+                    if "/ide_user_ent_usage" in url:
+                        return _resp({"total_balance": 1500, "user_entitlement_pack_list": []})
+                    raise AssertionError("unexpected url: " + url)
+
+                cb_query = urllib.parse.urlencode(
+                    {
+                        "isRedirect": "true",
+                        "scope": "marscode",
+                        "authCodeInfo": json.dumps({"AuthCode": "ac-xyz"}),
+                        "loginTraceID": tid,
+                        "host": "https://api.trae.cn",
+                    }
+                )
+                with patch("wbsignin.httpc.request", side_effect=fake_req):
+                    html_out = app.do_trae_oauth_callback(cb_query)
+                self.assertIn("TRAE CN 授权成功", html_out)
+                st = app.do_trae_oauth_status(tid)
+                self.assertEqual(st["status"], "done")
+                self.assertEqual(st["masked"], "TRAE-2号")
+
+                # 重放同一个 trace_id 回调必须被拒绝
+                replay = app.do_trae_oauth_callback(cb_query)
+                self.assertIn("无效或已过期", replay)
+
+                saved = vault.load()["accounts"]
+                self.assertEqual(len(saved), 2)
+                self.assertIn("trae-cn:1001", saved)
+                self.assertIn("trae-cn:2002", saved)
+                self.assertNotEqual(saved["trae-cn:2002"]["device"]["deviceId"], "dev-111")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -535,6 +535,81 @@ class OverseasFallbackTests(unittest.TestCase):
             self.assertIn("s2", saved[r1["key"]]["cookie"])
             self.assertEqual(saved[r3["key"]]["label"], "豆包-小号")
 
+    def test_doubao_qr_flow_and_redirect_whitelist(self):
+        import http.cookiejar
+        import tempfile
+        import urllib.request
+        from pathlib import Path
+        from unittest.mock import patch
+        from wbsignin import httpc
+        from wbsignin.vault import Vault
+        from wbsignin.web import App
+
+        handler = httpc._WhitelistedRedirectHandler()
+        orig_req = urllib.request.Request("https://accounts.doubao.com/x")
+        with self.assertRaises(httpc.ApiError) as ctx:
+            handler.redirect_request(orig_req, None, 302, "Found", {}, "https://evil.example.com/steal")
+        self.assertEqual(ctx.exception.kind, httpc.KIND_BAD_HOST)
+
+        def _add_cookie(jar, name, val, domain=".doubao.com"):
+            jar.set_cookie(
+                http.cookiejar.Cookie(
+                    version=0, name=name, value=val, port=None, port_specified=False,
+                    domain=domain, domain_specified=True, domain_initial_dot=True,
+                    path="/", path_specified=True, secure=True, expires=None,
+                    discard=True, comment=None, comment_url=None, rest={},
+                )
+            )
+
+        states = iter(["new", "scanned", "confirmed"])
+
+        def fake_cookie_get(url, jar, headers=None, **kw):
+            if "/get_qrcode/" in url:
+                return self._resp({"message": "success", "data": {"qrcode": "AAA=", "token": "qr-tok-1", "expire_time": 1800000000}})
+            if "/check_qrconnect/" in url:
+                st = next(states)
+                if st == "confirmed":
+                    return self._resp({"message": "success", "data": {"status": "confirmed", "redirect_url": "https://www.doubao.com/sso"}})
+                return self._resp({"message": "success", "data": {"status": st}})
+            if url == "https://www.doubao.com/sso":
+                _add_cookie(jar, "sessionid", "sid-qr-99")
+                _add_cookie(jar, "uid_tt", "uid-qr-99")
+                return self._resp({"ok": True})
+            raise AssertionError("unexpected qr url: " + url)
+
+        def fake_api_req(method, url, **kw):
+            if "/v3/detail/" in url:
+                return self._resp({"code": 2, "data": None})
+            if "/landing/checkin" in url:
+                return self._resp({"code": 0, "data": {"idempotent": True, "continuous_days": 3}})
+            if "/subscription/overview/" in url:
+                return self._resp({"code": 0, "data": {"quota_balance_overview": {"total_remaining_amount": "600"}}})
+            raise AssertionError("unexpected api url: " + url)
+
+        with tempfile.TemporaryDirectory() as d:
+            vault = Vault(Path(d) / "vault.json", "test-qr-pass-123")
+            app = App(vault)
+            with patch("wbsignin.httpc.cookie_session_get", side_effect=fake_cookie_get):
+                with patch("wbsignin.httpc.request", side_effect=fake_api_req):
+                    started = app.do_doubao_qr_start(name="扫码小号")
+                    self.assertTrue(started["qrcode"].startswith("data:image/png;base64,"))
+                    p1 = app.do_doubao_qr_poll(started["session_id"])
+                    self.assertEqual(p1["status"], "new")
+                    p2 = app.do_doubao_qr_poll(started["session_id"])
+                    self.assertEqual(p2["status"], "scanned")
+                    p3 = app.do_doubao_qr_poll(started["session_id"])
+                    self.assertEqual(p3["status"], "done")
+                    self.assertEqual(p3["masked"], "扫码小号")
+                    # 会话完成后应从内存中移除，再次轮询报 expired
+                    p4 = app.do_doubao_qr_poll(started["session_id"])
+                    self.assertEqual(p4["status"], "expired")
+
+            saved = vault.load()["accounts"]
+            self.assertEqual(len(saved), 1)
+            k = next(iter(saved))
+            self.assertEqual(saved[k]["label"], "扫码小号")
+            self.assertIn("sessionid=sid-qr-99", saved[k]["cookie"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import socket
 import time
@@ -83,17 +84,68 @@ def new_message_id() -> str:
     return "%012x%s" % (int(time.time() * 1000), uuid.uuid4().hex[:20])
 
 
-def _open_url(req: urllib.request.Request, timeout: float, proxy_url: str = ""):
+def _validate_proxy(proxy_url: str) -> str:
     proxy = (proxy_url or "").strip()
     if not proxy:
-        return urllib.request.urlopen(req, timeout=timeout)
+        return ""
     parsed = urllib.parse.urlsplit(proxy)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ApiError(KIND_BAD_HOST, "不支持的代理地址：%r（仅支持 http/https）" % proxy)
+    return proxy
+
+
+class _WhitelistedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """重定向每一跳均强制过 ALLOWED_HOSTS 白名单。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _check_host(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_url(req: urllib.request.Request, timeout: float, proxy_url: str = ""):
+    proxy = _validate_proxy(proxy_url)
+    if not proxy:
+        return urllib.request.urlopen(req, timeout=timeout)
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({"http": proxy, "https": proxy})
     )
     return opener.open(req, timeout=timeout)
+
+
+def cookie_session_get(
+    url: str,
+    jar: http.cookiejar.CookieJar,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float = config.REQUEST_TIMEOUT,
+    proxy_url: str = "",
+) -> Response:
+    """带独立 CookieJar 的 GET 请求（强制白名单与跳转校验，供扫码登录用）。"""
+    _check_host(url)
+    proxy = _validate_proxy(proxy_url)
+    handlers: list = [
+        _WhitelistedRedirectHandler(),
+        urllib.request.HTTPCookieProcessor(jar),
+    ]
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*handlers)
+    hdrs = dict(headers or {})
+    hdrs.setdefault("User-Agent", config.USER_AGENT)
+    req = urllib.request.Request(url, headers=hdrs, method="GET")
+    try:
+        with opener.open(req, timeout=timeout) as fp:
+            raw = fp.read()
+            status = fp.status
+        return _parse(status, raw)
+    except urllib.error.HTTPError as exc:
+        raw = b""
+        try:
+            raw = exc.read()
+        except Exception:
+            pass
+        return _parse(exc.code, raw)
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
+        raise ApiError(KIND_NETWORK, "网络异常：%s" % exc) from exc
 
 
 def request(

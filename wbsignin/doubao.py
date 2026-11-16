@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import http.cookiejar
 import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -737,3 +738,127 @@ def doubao_checkin(cookie: str, seed: str = "") -> Dict[str, Any]:
         "code": code,
         "error": _msg(payload) + "（code %s）" % code,
     }
+
+
+# ---------- 扫码登录（headless Passport QR） ----------
+_QR_HEADERS = {
+    "Referer": "https://www.doubao.com/",
+    "Origin": "https://www.doubao.com",
+    "Accept": "application/json, text/plain, */*",
+    "User-Agent": CLIENT_UA,
+}
+_AUTH_COOKIE_NAMES = frozenset(("sessionid", "sessionid_ss", "sid_tt", "uid_tt", "uid_tt_ss", "sid_guard"))
+
+
+def _qr_url(base: str, extra: Optional[Dict[str, str]] = None) -> str:
+    params: Dict[str, str] = {
+        "service": "https://www.doubao.com",
+        "next": "https://www.doubao.com",
+        "aid": "497858",
+        "account_sdk_source": "web",
+        "device_platform": "web",
+        "is_from_ttaccountsdk": "1",
+    }
+    if extra:
+        params.update(extra)
+    return base + "?" + urllib.parse.urlencode(params)
+
+
+def _jar_to_cookie_header(jar: http.cookiejar.CookieJar) -> str:
+    pairs: Dict[str, str] = {}
+    for c in jar:
+        dom = str(c.domain or "").lower()
+        if "doubao.com" in dom and c.name and c.value is not None:
+            pairs[c.name] = str(c.value)
+    return "; ".join(f"{k}={v}" for k, v in pairs.items())
+
+
+def _jar_csrf_token(jar: http.cookiejar.CookieJar) -> str:
+    for c in jar:
+        if c.name == "passport_csrf_token" and c.value:
+            return str(c.value)
+    for c in jar:
+        if c.name == "passport_csrf_token_default" and c.value:
+            return str(c.value)
+    return ""
+
+
+def _has_auth_cookie(jar: http.cookiejar.CookieJar) -> bool:
+    for c in jar:
+        dom = str(c.domain or "").lower()
+        if "doubao.com" in dom and c.name in _AUTH_COOKIE_NAMES and c.value:
+            return True
+    return False
+
+
+def qr_start() -> Dict[str, Any]:
+    """向 accounts.doubao.com 申请登录二维码，返回 {token, qrcode, expire_time, jar}。"""
+    jar = http.cookiejar.CookieJar()
+    resp = httpc.cookie_session_get(
+        _qr_url(config.DOUBAO_PASSPORT_QRCODE_URL),
+        jar,
+        headers=_QR_HEADERS,
+        proxy_url=config.doubao_proxy(),
+    )
+    payload = resp.payload if isinstance(resp.payload, dict) else {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    qr_img = str(data.get("qrcode") or "").strip()
+    token = str(data.get("token") or "").strip()
+    if payload.get("message") != "success" or not qr_img or not token:
+        desc = str(data.get("description") or payload.get("message") or ("HTTP %s" % resp.status))
+        raise httpc.ApiError(httpc.KIND_SERVER, "获取豆包二维码失败：%s" % desc)
+    if not qr_img.startswith("data:image/"):
+        qr_img = "data:image/png;base64," + qr_img
+    return {
+        "token": token,
+        "qrcode": qr_img,
+        "expire_time": _int(data.get("expire_time")),
+        "jar": jar,
+    }
+
+
+def qr_poll(token: str, jar: http.cookiejar.CookieJar) -> Dict[str, Any]:
+    """轮询豆包二维码扫码状态；确认后收集 .doubao.com 会话 Cookie。"""
+    tok = str(token or "").strip()
+    if not tok:
+        return {"status": "error", "error": "缺少二维码 token"}
+    hdrs = dict(_QR_HEADERS)
+    csrf = _jar_csrf_token(jar)
+    if csrf:
+        hdrs["x-tt-passport-csrf-token"] = csrf
+    resp = httpc.cookie_session_get(
+        _qr_url(config.DOUBAO_PASSPORT_CHECK_URL, {"token": tok}),
+        jar,
+        headers=hdrs,
+        proxy_url=config.doubao_proxy(),
+    )
+    payload = resp.payload if isinstance(resp.payload, dict) else {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    st = str(data.get("status") or "").lower()
+    if st in ("new", "scanned"):
+        return {"status": st}
+    if st == "refused":
+        return {"status": "refused", "error": "已在手机端拒绝登录"}
+    if st == "expired":
+        return {"status": "expired", "error": "二维码已过期，请重新获取"}
+    if st in ("confirmed", "login"):
+        redir = str(data.get("redirect_url") or "").strip()
+        if redir:
+            redir_host = urllib.parse.urlsplit(redir).hostname or ""
+            if redir_host in config.ALLOWED_HOSTS:
+                try:
+                    httpc.cookie_session_get(
+                        redir,
+                        jar,
+                        headers=hdrs,
+                        proxy_url=config.doubao_proxy(),
+                    )
+                except httpc.ApiError:
+                    pass
+        cookie_hdr = _jar_to_cookie_header(jar)
+        if not cookie_hdr or not _has_auth_cookie(jar):
+            return {"status": "error", "error": "扫码已确认但未收到 doubao.com 登录 Cookie"}
+        return {"status": "confirmed", "cookie": cookie_hdr}
+
+    desc = str(data.get("description") or payload.get("message") or ("HTTP %s" % resp.status))
+    return {"status": "error", "error": "扫码状态异常：%s" % desc}
