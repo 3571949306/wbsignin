@@ -203,6 +203,27 @@ def persist_run_state(report: "RunReport") -> None:
 
 
 # ---------- 阶段 1：续期 ----------
+def _account_needs_refresh(acc: Account) -> bool:
+    if acc.is_workbuddy:
+        return needs_refresh(acc.access_token)
+    if acc.is_trae:
+        from . import trae
+
+        dev = acc.device or {}
+        if not acc.refresh_token or not dev.get("privateKeyPEM") or not dev.get("publicKeyPEM"):
+            return False
+        return trae.needs_refresh(acc.access_token, acc.at_exp)
+    return False
+
+
+def _refresh_account(cur: Account) -> Dict[str, Any]:
+    if cur.is_trae:
+        from . import trae
+
+        return trae.refresh_session(cur.refresh_token, cur.access_token, cur.device)
+    return refresh(cur.refresh_token, cur.access_token)
+
+
 def refresh_all(
     accounts: Dict[str, Account],
     vault: Vault,
@@ -214,10 +235,7 @@ def refresh_all(
     拿到锁后读到的是已经轮换过的新 RT，不会用旧 RT 去刷新。
     """
     errors: Dict[str, str] = {}
-    pending = [
-        a for a in accounts.values()
-        if a.is_workbuddy and needs_refresh(a.access_token)
-    ]
+    pending = [a for a in accounts.values() if _account_needs_refresh(a)]
     if not pending:
         return errors
 
@@ -228,23 +246,23 @@ def refresh_all(
             cur = fresh.get(acc.phone)
             if cur is None:
                 continue
-            if not needs_refresh(cur.access_token):
+            if not _account_needs_refresh(cur):
                 acc.access_token = cur.access_token
                 acc.refresh_token = cur.refresh_token
                 acc.uid = cur.uid or acc.uid
                 acc.at_exp = cur.at_exp
                 continue
             try:
-                got = refresh(cur.refresh_token, cur.access_token)
+                got = _refresh_account(cur)
             except httpc.ApiError as exc:
                 errors[acc.phone] = exc.detail
                 cur.last_error = "%s %s" % (exc.kind, exc.detail)
                 fresh[acc.phone] = cur
                 continue
             cur.access_token = got["access_token"]
-            cur.refresh_token = got["refresh_token"]
+            cur.refresh_token = got.get("refresh_token") or cur.refresh_token
             cur.uid = got.get("uid") or cur.uid
-            cur.at_exp = int(got.get("at_exp") or 0)
+            cur.at_exp = int(got.get("at_exp") or cur.at_exp or 0)
             cur.updated = time.strftime("%Y-%m-%d %H:%M:%S")
             cur.last_error = ""
             fresh[acc.phone] = cur
@@ -396,6 +414,101 @@ def upsert_doubao_account(
     }
 
 
+def upsert_trae_account(
+    vault: Vault,
+    token_or_payload: Any,
+    name: str = "",
+    refresh_token: str = "",
+    device: Any = None,
+    uid: str = "",
+    expires_at: Any = None,
+) -> Dict[str, Any]:
+    """校验并按 UserID 去重保存 TRAE CN 凭据（CLI 与 Web 共用）。"""
+    from . import trae
+
+    payload_in: Dict[str, Any] = {}
+    if isinstance(token_or_payload, dict):
+        payload_in = token_or_payload
+        raw_tok = str(
+            payload_in.get("token") or payload_in.get("access_token") or ""
+        ).strip()
+    else:
+        raw_tok = str(token_or_payload or "").strip()
+        if raw_tok.startswith("{"):
+            try:
+                parsed = json.loads(raw_tok)
+            except ValueError as exc:
+                raise httpc.ApiError(httpc.KIND_BAD_RESPONSE, "JSON 解析失败：%s" % exc)
+            if not isinstance(parsed, dict):
+                raise httpc.ApiError(httpc.KIND_BAD_RESPONSE, "凭据 JSON 必须为对象")
+            payload_in = parsed
+            raw_tok = str(
+                payload_in.get("token") or payload_in.get("access_token") or ""
+            ).strip()
+
+    if not raw_tok:
+        raise httpc.ApiError(httpc.KIND_BAD_RESPONSE, "TRAE CN Token 不能为空")
+
+    rt = str(
+        refresh_token
+        or payload_in.get("refresh_token")
+        or payload_in.get("refreshToken")
+        or ""
+    ).strip()
+    dev = (
+        dict(device)
+        if isinstance(device, dict)
+        else (
+            dict(payload_in.get("device"))
+            if isinstance(payload_in.get("device"), dict)
+            else {}
+        )
+    )
+    eff_name = str(
+        name or payload_in.get("label") or payload_in.get("name") or ""
+    ).strip()
+    exp_ts = trae.parse_expires_at(
+        expires_at
+        or payload_in.get("expires_at")
+        or payload_in.get("expiresAt")
+        or payload_in.get("expiredAt")
+    )
+
+    info = trae.verify_token(raw_tok, dev)
+    eff_uid = str(uid or payload_in.get("uid") or info.get("uid") or "").strip()
+    ident = info.get("masked_mobile") or info.get("masked_email") or info.get("screen_name") or (eff_uid or "default")[:8]
+    default_label = "TRAE CN(%s)" % ident
+
+    key = "%s:%s" % (trae.PROVIDER_CN, eff_uid or eff_name or "default")
+    with FileLock(config.lock_path()):
+        data = vault.load()
+        existing = (data.get("accounts") or {}).get(key) or {}
+        acc = Account.from_dict(key, existing)
+        label = eff_name or (acc.label or "").strip() or default_label
+        acc.provider = trae.PROVIDER_CN
+        acc.access_token = raw_tok
+        acc.refresh_token = rt or acc.refresh_token
+        acc.uid = eff_uid
+        acc.at_exp = exp_ts or acc.at_exp
+        acc.label = label
+        if dev:
+            acc.device = {**acc.device, **dev}
+        acc.updated = time.strftime("%Y-%m-%d %H:%M:%S")
+        acc.last_error = ""
+        data.setdefault("accounts", {})[key] = acc.to_dict()
+        vault.save(data)
+
+    snap, exp = trae.trae_credits(raw_tok, dev)
+    return {
+        "key": key,
+        "masked": label,
+        "provider": trae.PROVIDER_CN,
+        "credit": _num(snap.total_remain) if not snap.error else None,
+        "snap": snap,
+        "expiry": exp,
+    }
+
+
 def _work_qoder(acc: Account, want_credits: bool) -> AccountOutcome:
     from . import qoder
 
@@ -412,11 +525,29 @@ def _work_qoder(acc: Account, want_credits: bool) -> AccountOutcome:
     return out
 
 
+def _work_trae(acc: Account, want_credits: bool) -> AccountOutcome:
+    from . import trae
+
+    out = AccountOutcome(phone=acc.phone, uid=acc.uid, provider=acc.provider,
+                         label=acc.masked())
+    if not acc.access_token:
+        out.refresh_error = "缺少 TRAE CN token，需重新导入"
+        return out
+    out.checkin = trae.trae_checkin(acc.access_token, acc.device)
+    if want_credits and not (out.checkin and out.checkin.kind == httpc.KIND_AUTH):
+        snap, exp = trae.trae_credits(acc.access_token, acc.device)
+        out.credits = snap
+        out.expiry = exp
+    return out
+
+
 def _work(acc: Account, want_credits: bool) -> AccountOutcome:
     if acc.is_doubao:
         return _work_doubao(acc, want_credits)
     if acc.is_qoder:
         return _work_qoder(acc, want_credits)
+    if acc.is_trae:
+        return _work_trae(acc, want_credits)
     out = AccountOutcome(phone=acc.phone, uid=acc.uid, provider=acc.provider,
                          label=acc.masked())
     if not acc.access_token:

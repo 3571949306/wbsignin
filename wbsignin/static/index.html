@@ -86,7 +86,7 @@
   <header>
     <div>
       <h1>wbsignin <span class="dot">·</span> 签到控制台</h1>
-      <div class="sub">WorkBuddy · 豆包 · Qoder 多账号自动签到 · 仅本机可访问 · 时区 Asia/Shanghai</div>
+      <div class="sub">WorkBuddy · 豆包 · Qoder · TRAE CN 多账号自动签到 · 仅本机可访问 · 时区 Asia/Shanghai</div>
     </div>
     <div class="sub" id="server-time">--</div>
   </header>
@@ -103,6 +103,7 @@
     <button id="btn-add" class="ghost">＋ 添加账号</button>
     <button id="btn-add-db" class="ghost">＋ 添加豆包</button>
     <button id="btn-add-qoder" class="ghost">＋ 添加 Qoder</button>
+    <button id="btn-add-trae" class="ghost">＋ 添加 TRAE CN</button>
   </div>
 
   <div id="result"></div>
@@ -167,6 +168,20 @@
   </div>
 </dialog>
 
+<dialog id="add-trae-dlg">
+  <h3>添加 TRAE CN 账号（trae.cn）</h3>
+  <label>账号名称（可选，如「TRAE 主号」）</label>
+  <input id="in-trae-name" placeholder="TRAE CN（可选）">
+  <label>凭据 JSON（或 Cloud-IDE-JWT Token）</label>
+  <textarea id="in-trae-token" rows="4" placeholder="推荐使用 python tools/pull_trae_cred.py --json 输出的完整 JSON（含刷新密钥）" style="width:100%;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;resize:vertical"></textarea>
+  <div class="hint">导入完整 JSON 后可在服务器每日自动签到并在令牌临期时自动续期。</div>
+  <div class="err" id="add-trae-err"></div>
+  <div class="modal-foot">
+    <button id="btn-trae-cancel" class="ghost">取消</button>
+    <button id="btn-trae-confirm">确认添加</button>
+  </div>
+</dialog>
+
 <script>
 const $ = s => document.querySelector(s);
 const H = { 'X-Requested-With': 'wbsignin' };
@@ -194,7 +209,7 @@ function renderAccounts(accounts) {
   const body = $('#acct-body');
   if (!accounts.length) { body.innerHTML = '<div class="empty">暂无账号，点「添加账号」登录第一个。</div>'; return; }
 
-  const PROVIDER_BADGE = { 'doubao': '豆包', 'qoder-cn': 'Qoder国内', 'qoder': 'Qoder国际' };
+  const PROVIDER_BADGE = { 'doubao': '豆包', 'qoder-cn': 'Qoder国内', 'qoder': 'Qoder国际', 'trae-cn': 'TRAE CN' };
   const rows = accounts.map(a => {
     const isDb = a.provider === 'doubao';
     const isQoder = a.provider === 'qoder' || a.provider === 'qoder-cn';
@@ -361,6 +376,25 @@ $('#btn-qoder-confirm').onclick = async () => {
     await refresh();
   } catch (e) { $('#add-qoder-err').textContent = '添加失败：' + e.message; }
   finally { busy($('#btn-qoder-confirm'), false); }
+};
+
+// ---- 添加 TRAE CN ----
+const traeDlg = $('#add-trae-dlg');
+$('#btn-add-trae').onclick = () => { $('#add-trae-err').textContent = ''; traeDlg.showModal(); };
+$('#btn-trae-cancel').onclick = () => traeDlg.close();
+
+$('#btn-trae-confirm').onclick = async () => {
+  const name = $('#in-trae-name').value.trim();
+  const token = $('#in-trae-token').value.trim();
+  $('#add-trae-err').textContent = '';
+  if (!token) { $('#add-trae-err').textContent = '请粘贴凭据 JSON 或 Token'; return; }
+  busy($('#btn-trae-confirm'), true, '校验中…');
+  try {
+    await post('/api/login-trae', { name, token });
+    traeDlg.close(); $('#in-trae-token').value = '';
+    await refresh();
+  } catch (e) { $('#add-trae-err').textContent = '添加失败：' + e.message; }
+  finally { busy($('#btn-trae-confirm'), false); }
 };
 
 // ---- 移除账号 ----

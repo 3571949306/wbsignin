@@ -165,17 +165,17 @@ def needs_refresh(at: str, threshold_seconds: int = 24 * 3600) -> bool:
 
 @dataclass
 class Account:
-    phone: str  # 唯一键：WorkBuddy 用手机号，豆包用「doubao:<seed>」，Qoder 用「qoder:<uid>」或「qoder-cn:<uid>」
-    provider: str = "workbuddy"  # "workbuddy" | "doubao" | "qoder" | "qoder-cn"
+    phone: str  # 唯一键：WorkBuddy 用手机号，豆包用「doubao:<seed>」，Qoder 用「qoder:<uid>」或「qoder-cn:<uid>」，TRAE CN 用「trae-cn:<uid>」
+    provider: str = "workbuddy"  # "workbuddy" | "doubao" | "qoder" | "qoder-cn" | "trae-cn"
     access_token: str = ""
     refresh_token: str = ""
     cookie: str = ""   # 豆包专用：doubao.com 会话 Cookie
-    uid: str = ""      # WorkBuddy：JWT sub；豆包：设备指纹 seed；Qoder：userId
+    uid: str = ""      # WorkBuddy：JWT sub；豆包：设备指纹 seed；Qoder / TRAE：userId
     at_exp: int = 0
     updated: str = ""
     last_error: str = ""
-    label: str = ""    # 展示名（豆包 / Qoder 用）
-    device: Dict[str, Any] = field(default_factory=dict)  # Qoder 设备风控标识（Cosy-*）
+    label: str = ""    # 展示名（豆包 / Qoder / TRAE 用）
+    device: Dict[str, Any] = field(default_factory=dict)  # 设备风控标识与签名密钥（Qoder / TRAE 用）
 
     @classmethod
     def from_dict(cls, phone: str, d: Dict[str, Any]) -> "Account":
@@ -219,6 +219,10 @@ class Account:
         return self.provider in ("qoder", "qoder-cn")
 
     @property
+    def is_trae(self) -> bool:
+        return self.provider == "trae-cn"
+
+    @property
     def is_workbuddy(self) -> bool:
         return self.provider == "workbuddy"
 
@@ -229,5 +233,7 @@ class Account:
             return "豆包"
         if self.is_qoder:
             return "Qoder国内" if self.provider == "qoder-cn" else "Qoder国际"
+        if self.is_trae:
+            return "TRAE CN"
         p = self.phone or ""
         return p[:3] + "****" + p[-4:] if len(p) >= 8 else p

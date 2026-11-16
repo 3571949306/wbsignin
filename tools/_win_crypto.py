@@ -59,7 +59,11 @@ def _c_ubyte_array(data: bytes):
     return (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
 
 
-def _cng_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes) -> bytes:
+from contextlib import contextmanager
+
+
+@contextmanager
+def _cng_aes_key(mode_name: str, key: bytes):
     bcrypt = ctypes.windll.bcrypt
     h_alg = ctypes.c_void_p()
     h_key = ctypes.c_void_p()
@@ -70,7 +74,7 @@ def _cng_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes
     if status != 0:
         raise RuntimeError("BCryptOpenAlgorithmProvider 失败: 0x%08x" % (status & 0xFFFFFFFF))
     try:
-        mode_val = ctypes.create_unicode_buffer("ChainingModeGCM")
+        mode_val = ctypes.create_unicode_buffer(mode_name)
         status = bcrypt.BCryptSetProperty(
             h_alg,
             ctypes.c_wchar_p("ChainingMode"),
@@ -87,7 +91,16 @@ def _cng_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes
         )
         if status != 0:
             raise RuntimeError("BCryptGenerateSymmetricKey 失败: 0x%08x" % (status & 0xFFFFFFFF))
+        yield bcrypt, h_key
+    finally:
+        if h_key.value:
+            bcrypt.BCryptDestroyKey(h_key)
+        if h_alg.value:
+            bcrypt.BCryptCloseAlgorithmProvider(h_alg, 0)
 
+
+def _cng_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes) -> bytes:
+    with _cng_aes_key("ChainingModeGCM", key) as (bcrypt, h_key):
         nonce_buf = _c_ubyte_array(nonce)
         tag_buf = _c_ubyte_array(tag)
         ct_buf = _c_ubyte_array(ciphertext)
@@ -117,11 +130,6 @@ def _cng_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes
         if status != 0:
             raise RuntimeError("BCryptDecrypt 失败: 0x%08x" % (status & 0xFFFFFFFF))
         return bytes(pt_buf[: cb_out.value])
-    finally:
-        if h_key.value:
-            bcrypt.BCryptDestroyKey(h_key)
-        if h_alg.value:
-            bcrypt.BCryptCloseAlgorithmProvider(h_alg, 0)
 
 
 def aes_gcm_decrypt(key: bytes, nonce: bytes, data: bytes) -> bytes:
@@ -134,6 +142,41 @@ def aes_gcm_decrypt(key: bytes, nonce: bytes, data: bytes) -> bytes:
         if len(data) < 16:
             raise ValueError("AES-GCM 密文长度不足 16 字节")
         return _cng_aes_gcm_decrypt(key, nonce, data[:-16], data[-16:])
+
+
+def _cng_aes_cbc_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
+    with _cng_aes_key("ChainingModeCBC", key) as (bcrypt, h_key):
+        ct_buf = _c_ubyte_array(ciphertext)
+        iv_buf = _c_ubyte_array(iv)
+        cb_out = wintypes.ULONG(0)
+        status = bcrypt.BCryptDecrypt(
+            h_key, ct_buf, len(ciphertext), None, iv_buf, len(iv), None, 0, ctypes.byref(cb_out), 1
+        )
+        if status != 0:
+            raise RuntimeError("BCryptDecrypt 计算长度失败: 0x%08x" % (status & 0xFFFFFFFF))
+
+        pt_buf = (ctypes.c_ubyte * max(1, cb_out.value))()
+        iv_buf2 = _c_ubyte_array(iv)
+        status = bcrypt.BCryptDecrypt(
+            h_key, ct_buf, len(ciphertext), None, iv_buf2, len(iv), pt_buf, cb_out.value, ctypes.byref(cb_out), 1
+        )
+        if status != 0:
+            raise RuntimeError("BCryptDecrypt 失败: 0x%08x" % (status & 0xFFFFFFFF))
+        return bytes(pt_buf[: cb_out.value])
+
+
+def aes_cbc_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
+    """使用 PKCS#7 解密 AES-CBC 密文（零第三方依赖）。"""
+    try:
+        from cryptography.hazmat.primitives import padding as sym_pad  # type: ignore
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # type: ignore
+
+        dec = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+        padded = dec.update(ciphertext) + dec.finalize()
+        unpadder = sym_pad.PKCS7(128).unpadder()
+        return unpadder.update(padded) + unpadder.finalize()
+    except ImportError:
+        return _cng_aes_cbc_decrypt(key, iv, ciphertext)
 
 
 def chromium_local_state_key(user_data_dir: Path) -> bytes:

@@ -29,7 +29,13 @@ from typing import Any, Dict, Optional
 from . import config, httpc
 from .auth import login, send_sms
 from .lock import is_locked
-from .runner import load_accounts, load_state, run, upsert_doubao_account
+from .runner import (
+    load_accounts,
+    load_state,
+    run,
+    upsert_doubao_account,
+    upsert_trae_account,
+)
 from .tasks import ST_ALREADY, ST_SIGNED, query_credits
 from .vault import Vault
 
@@ -118,7 +124,7 @@ class App:
         rows = []
         for o in report.outcomes:
             has_balance = bool(o.credits) and not o.credits.error and (
-                bool(o.credits.packages) or o.provider in ("doubao", "qoder", "qoder-cn")
+                bool(o.credits.packages) or o.provider in ("doubao", "qoder", "qoder-cn", "trae-cn")
             )
             rows.append(
                 {
@@ -145,7 +151,7 @@ class App:
         }
 
     def do_credit(self) -> Dict[str, Any]:
-        from . import doubao, qoder
+        from . import doubao, qoder, trae
 
         accounts = self._accounts()
         out = {}
@@ -153,38 +159,26 @@ class App:
             a = accounts[phone]
             if a.is_doubao:
                 snap, _exp = doubao.doubao_credits(a.cookie, a.uid or "")
-                if snap.error:
-                    out[a.masked()] = {"error": snap.error}
-                    continue
-                self._credits[phone] = {
-                    "total": _num(snap.total_remain),
-                    "lines": snap.lines(),
-                    "paid": snap.is_paid,
-                }
-                out[a.masked()] = self._credits[phone]
-                continue
-            if a.is_qoder:
+                key_label = a.masked()
+            elif a.is_qoder:
                 snap, _exp = qoder.qoder_credits(a.access_token, a.provider, a.device)
-                if snap.error:
-                    out[a.masked()] = {"error": snap.error}
-                    continue
-                self._credits[phone] = {
-                    "total": _num(snap.total_remain),
-                    "lines": snap.lines(),
-                    "paid": snap.is_paid,
-                }
-                out[a.masked()] = self._credits[phone]
-                continue
-            snap = query_credits(a.access_token, a.uid)
+                key_label = a.masked()
+            elif a.is_trae:
+                snap, _exp = trae.trae_credits(a.access_token, a.device)
+                key_label = a.masked()
+            else:
+                snap = query_credits(a.access_token, a.uid)
+                key_label = _mask(phone)
+
             if snap.error:
-                out[_mask(phone)] = {"error": snap.error}
+                out[key_label] = {"error": snap.error}
                 continue
             self._credits[phone] = {
                 "total": _num(snap.total_remain),
                 "lines": snap.lines(),
                 "paid": snap.is_paid,
             }
-            out[_mask(phone)] = self._credits[phone]
+            out[key_label] = self._credits[phone]
         _log("积分/额度已刷新")
         return {"items": out}
 
@@ -326,6 +320,38 @@ class App:
             "masked": label,
             "provider": provider,
             "credit": _num(snap.total_remain) if not snap.error else None,
+        }
+
+    def do_login_trae(
+        self,
+        token: str = "",
+        name: str = "",
+        refresh_token: str = "",
+        device: Any = None,
+        uid: str = "",
+        expires_at: Any = None,
+    ) -> Dict[str, Any]:
+        res = upsert_trae_account(
+            self.vault,
+            token,
+            name=name,
+            refresh_token=refresh_token,
+            device=device,
+            uid=uid,
+            expires_at=expires_at,
+        )
+        snap = res.get("snap")
+        if snap and not snap.error:
+            self._credits[res["key"]] = {
+                "total": _num(snap.total_remain),
+                "lines": snap.lines(),
+                "paid": snap.is_paid,
+            }
+        _log("TRAE CN 账号 %s 已添加" % res["masked"])
+        return {
+            "masked": res["masked"],
+            "provider": res["provider"],
+            "credit": res.get("credit"),
         }
 
 
@@ -476,6 +502,18 @@ class Handler(BaseHTTPRequestHandler):
                         device=body.get("device"),
                         uid=str(body.get("uid") or ""),
                         expires_at=body.get("expires_at") or body.get("expiresAt"),
+                    ),
+                )
+            elif path == "/api/login-trae":
+                _send(
+                    self,
+                    app.do_login_trae(
+                        token=str(body.get("token") or body.get("access_token") or ""),
+                        name=str(body.get("name") or body.get("label") or ""),
+                        refresh_token=str(body.get("refresh_token") or body.get("refreshToken") or ""),
+                        device=body.get("device"),
+                        uid=str(body.get("uid") or ""),
+                        expires_at=body.get("expires_at") or body.get("expiresAt") or body.get("expiredAt"),
                     ),
                 )
             elif path == "/api/remove":

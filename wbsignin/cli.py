@@ -164,6 +164,46 @@ def cmd_login_qoder(args) -> int:
     return 0
 
 
+def cmd_login_trae(args) -> int:
+    """导入 TRAE CN（trae.cn）凭据：支持 Token 或 pull_trae_cred.py --json 输出。"""
+    from .runner import upsert_trae_account
+
+    vault = _open_vault()
+    payload: Any = ""
+    if args.from_json:
+        raw_text = Path(args.from_json).expanduser().read_text(encoding="utf-8")
+        try:
+            parsed = json.loads(raw_text)
+        except ValueError as exc:
+            _say("%s JSON 文件解析失败：%s" % (MARK["bad"], exc))
+            return 2
+        if not isinstance(parsed, dict):
+            _say("%s 凭据 JSON 必须为对象" % MARK["bad"])
+            return 2
+        payload = parsed
+    elif args.token:
+        payload = args.token.strip()
+    else:
+        payload = input("TRAE CN Token（或凭据 JSON）: ").strip()
+
+    if not payload:
+        _say("%s Token 不能为空" % MARK["bad"])
+        return 2
+
+    device = json.loads(args.device_json) if args.device_json else None
+    _say("%s 正在校验 TRAE CN 凭据 ..." % MARK["dot"])
+    res = upsert_trae_account(
+        vault,
+        payload,
+        name=(args.name or "").strip(),
+        refresh_token=(args.refresh_token or "").strip(),
+        device=device,
+    )
+    credit_str = res["credit"] if res.get("credit") is not None else "-"
+    _say("%s TRAE CN「%s」已添加（剩余 %s 积分）" % (MARK["ok"], res["masked"], credit_str))
+    return 0
+
+
 def vault_exists() -> bool:
     return config.vault_path().exists()
 
@@ -190,6 +230,9 @@ def cmd_accounts(args) -> int:
             expire = a.uid[:8] if a.uid else "-"
         elif a.is_qoder:
             mark = "Qoder国内" if a.provider == "qoder-cn" else "Qoder国际"
+            expire = _fmt_ts(a.at_exp) if a.at_exp else (a.uid[:8] or "-")
+        elif a.is_trae:
+            mark = "TRAE CN"
             expire = _fmt_ts(a.at_exp) if a.at_exp else (a.uid[:8] or "-")
         else:
             mark = "WorkBuddy"
@@ -239,7 +282,9 @@ def cmd_signin(args) -> int:
             continue
         mark = MARK["ok"] if c.status in (ST_SIGNED, ST_ALREADY) else MARK["bad"]
         line = "%s %-13s %s" % (mark, o.masked, c.summary())
-        if o.credits and not o.credits.error and (o.credits.packages or o.provider == "doubao"):
+        if o.credits and not o.credits.error and (
+            o.credits.packages or o.provider in ("doubao", "qoder", "qoder-cn", "trae-cn")
+        ):
             unit = "额度" if o.provider == "doubao" else ("Credits" if o.provider.startswith("qoder") else "积分")
             line += "｜剩余%s %s" % (unit, _num(o.credits.total_remain))
         _say(line)
@@ -265,48 +310,36 @@ def cmd_credit(args) -> int:
         _say("%s 没有匹配的账号" % MARK["warn"])
         return 1
 
-    # 先确保 WorkBuddy 令牌可用（过期则续期）；豆包与 Qoder 无需此步
-    wb = {p: a for p, a in accounts.items() if a.is_workbuddy}
-    if wb:
-        refresh_all(wb, vault, lambda s: _say(s))
+    # 先确保 WorkBuddy / TRAE CN 令牌可用（临期则续期）
+    refreshable = {p: a for p, a in accounts.items() if a.is_workbuddy or a.is_trae}
+    if refreshable:
+        refresh_all(refreshable, vault, lambda s: _say(s))
 
-    from . import qoder
+    from . import qoder, trae
 
     rc = 0
     for phone in sorted(accounts):
         a = accounts[phone]
         if a.is_doubao:
             snap, exp = doubao.doubao_credits(a.cookie, a.uid or "")
-            if snap.error:
-                _say("%s %-18s 查询失败：%s" % (MARK["bad"], a.masked(), snap.error))
-                rc = 1
-                continue
-            tail = "｜到期 %s" % exp["expire"] if exp.get("expire") else ""
-            _say("%s %-18s 剩余额度 %s%s"
-                 % (MARK["ok"], a.masked(), _num(snap.total_remain), tail))
-            for line in snap.lines():
-                _say("    %s" % line)
-            continue
-        if a.is_qoder:
+            unit = "额度"
+        elif a.is_qoder:
             snap, exp = qoder.qoder_credits(a.access_token, a.provider, a.device)
-            if snap.error:
-                _say("%s %-18s 查询失败：%s" % (MARK["bad"], a.masked(), snap.error))
-                rc = 1
-                continue
-            tail = "｜到期 %s" % exp["expire"] if exp.get("expire") else ""
-            _say("%s %-18s 剩余 Credits %s%s"
-                 % (MARK["ok"], a.masked(), _num(snap.total_remain), tail))
-            for line in snap.lines():
-                _say("    %s" % line)
-            continue
-        snap = query_credits(a.access_token, a.uid)
+            unit = " Credits"
+        elif a.is_trae:
+            snap, exp = trae.trae_credits(a.access_token, a.device)
+            unit = "积分"
+        else:
+            snap, exp = query_credits(a.access_token, a.uid), {}
+            unit = "积分合计"
+
         if snap.error:
             _say("%s %-18s 查询失败：%s" % (MARK["bad"], a.masked(), snap.error))
             rc = 1
             continue
-        _say("%s %-18s 剩余积分合计 %s%s"
-             % (MARK["ok"], a.masked(), _num(snap.total_remain),
-                "（付费）" if snap.is_paid else ""))
+        tail = "｜到期 %s" % exp["expire"] if exp.get("expire") else ("（付费）" if a.is_workbuddy and snap.is_paid else "")
+        _say("%s %-18s 剩余%s %s%s"
+             % (MARK["ok"], a.masked(), unit, _num(snap.total_remain), tail))
         for line in snap.lines():
             _say("    %s" % line)
     return rc
@@ -342,7 +375,7 @@ def cmd_doctor(args) -> int:
     _say("")
     _say("网络连通性（仅握手，不提交任何凭据）")
     ok = True
-    for host in ("www.workbuddy.cn", "copilot.tencent.com", "www.doubao.com", "openapi.qoder.sh", "openapi.qoder.com.cn"):
+    for host in ("www.workbuddy.cn", "copilot.tencent.com", "www.doubao.com", "openapi.qoder.sh", "openapi.qoder.com.cn", "api.trae.cn", "api.trae.com.cn"):
         try:
             import socket
 
@@ -438,7 +471,7 @@ def _num(v) -> str:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="wbsignin",
-        description="WorkBuddy / 豆包 / Qoder 多账号自动签到（零依赖，可在无 GUI 服务器运行）",
+        description="WorkBuddy / 豆包 / Qoder / TRAE CN 多账号自动签到（零依赖，可在无 GUI 服务器运行）",
     )
     p.add_argument("-V", "--version", action="version", version="wbsignin " + __version__)
     sub = p.add_subparsers(dest="cmd")
@@ -464,6 +497,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--device-json", help="可选设备风控 JSON 字符串")
     sp.add_argument("--from-json", help="从 JSON 文件导入完整 Qoder 凭据（含设备标识）")
     sp.set_defaults(func=cmd_login_qoder)
+
+    sp = sub.add_parser("login-trae", help="添加 TRAE CN（trae.cn）账号")
+    sp.add_argument("name", nargs="?", help="账号名称；省略则自动生成")
+    sp.add_argument("--token", help="TRAE CN access token（Cloud-IDE-JWT）")
+    sp.add_argument("--refresh-token", help="可选 RefreshToken")
+    sp.add_argument("--device-json", help="可选设备标识 JSON 字符串")
+    sp.add_argument("--from-json", help="从 JSON 文件导入完整 TRAE CN 凭据（含 P-256 密钥对）")
+    sp.set_defaults(func=cmd_login_trae)
 
     sp = sub.add_parser("accounts", help="列出已保存账号")
     sp.set_defaults(func=cmd_accounts)

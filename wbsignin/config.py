@@ -36,6 +36,10 @@ def doubao_proxy() -> str:
 QODER_INTL_BASE = "https://openapi.qoder.sh"
 QODER_CN_BASE = "https://openapi.qoder.com.cn"
 
+# TRAE CN（trae.cn）
+TRAE_CN_API_BASE = "https://api.trae.cn"
+TRAE_CN_LOGIN_CHECK_BASE = "https://api.trae.com.cn"
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/138.0.7204.251 Safari/537.36"
@@ -50,6 +54,8 @@ ALLOWED_HOSTS = frozenset(
         "www.doubao.com",
         "openapi.qoder.sh",
         "openapi.qoder.com.cn",
+        "api.trae.cn",
+        "api.trae.com.cn",
     }
 )
 

@@ -1,6 +1,6 @@
 # wbsignin
 
-**WorkBuddy / 豆包（Doubao）/ Qoder（国内版 & 国际版）** 多账号每日自动签到与剩余额度查询工具。  
+**WorkBuddy / 豆包（Doubao）/ Qoder（国内版 & 国际版）/ TRAE CN** 多账号每日自动签到与剩余额度查询工具。  
 全 Python 标准库编写，**零第三方依赖**，原生支持无图形界面（Headless）的 Linux 云服务器与 Windows 本机部署。
 
 ```
@@ -23,6 +23,7 @@ $ wbsignin signin
 | **豆包（doubao.com）** | 会话 Cookie 粘贴，或 Windows 本机一键提取（多浏览器 & 多 Profile） | 自动兼容海外服务器 IP 降级策略、查询真实实时剩余额度（套餐 + 活动赠送）与到期时间 |
 | **Qoder 国内版**（`qoder-cn`） | PAT（`pt-...`）/ 客户端凭据提取（含设备风控标识） | 每日北京时间 10:00 轮次自动领取 100 Credits、剩余 Credits 与到期时间 |
 | **Qoder 国际版**（`qoder`） | 同上（支持 `openapi.qoder.sh` 与 `openapi.qoder.com.cn` 并存） | 同上 |
+| **TRAE CN**（`trae-cn`） | 客户端凭据提取（含 P-256 设备签名密钥，零依赖解密） | 每日积分自动签到、总余额/有效期包明细，临期自动通过 P-256 DeviceProof 续期 |
 
 ## 工程设计亮点
 
@@ -155,6 +156,21 @@ python tools/pull_qoder_cred.py --local
 python tools/pull_qoder_cred.py --push --host <your-server>
 ```
 
+### 4. 添加 TRAE CN 账号（trae.cn）
+
+支持从命令行导入或使用 [pull_trae_cred.py](tools/pull_trae_cred.py) 直接解密本机 TRAE CN 桌面端凭据与 P-256 设备密钥：
+
+```powershell
+# 预览本机已登录的 TRAE CN 凭据（全脱敏）
+python tools/pull_trae_cred.py
+
+# 直接导入到本机 wbsignin
+python tools/pull_trae_cred.py --local
+
+# 一键推送到远端 Linux 服务器（含自动续期所需的 P-256 设备私钥）
+python tools/pull_trae_cred.py --push --host <your-server>
+```
+
 ---
 
 ## 日常命令
@@ -166,14 +182,14 @@ wbsignin signin                # 执行全部账号签到与余额快照刷新
 wbsignin signin --jobs 1       # 串行执行，进一步降低占用
 wbsignin signin --quiet        # 精简输出，适合定时任务日志
 wbsignin credit                # 查询各账号详细剩余积分 / 额度 / Credits 明细与到期日
-wbsignin doctor                # 环境、凭据库解密与 5 个上游域名 HTTPS 连通性自检（全脱敏）
+wbsignin doctor                # 环境、凭据库解密与 7 个上游域名 HTTPS 连通性自检（全脱敏）
 ```
 
 ---
 
 ## Web 仪表盘（可选）
 
-仅监听 **`127.0.0.1`**，公网不可直接访问；支持查看账号状态、剩余额度与悬停明细、触发立即签到、添加 WorkBuddy / 豆包 / Qoder 账号、查看实时日志：
+仅监听 **`127.0.0.1`**，公网不可直接访问；支持查看账号状态、剩余额度与悬停明细、触发立即签到、添加 WorkBuddy / 豆包 / Qoder / TRAE CN 账号、查看实时日志：
 
 ```bash
 # 1. 手动启动（或安装时加 --with-web 自动常驻）
@@ -229,20 +245,23 @@ wbsignin/
     tasks.py               WorkBuddy 签到与积分/到期解析
     doubao.py              豆包签到、海外 IP 降级策略与实时剩余额度查询
     qoder.py               Qoder 国内版 / 国际版 PAT 兑换、签到与配额查询
+    trae.py                TRAE CN 签到、积分包查询与纯标准库 P-256 续期
     runner.py              多账号并发编排、凭据去重与状态快照持久化
     schedule.py            systemd timer / web service 与 cron 生成
     web.py                 仅限本机的零依赖 HTTP API 与控制台后端
     static/index.html      Web 控制台前端页面
     cli.py                 命令行主入口
   tools/
-    _win_crypto.py         Windows DPAPI + CNG AES-256-GCM 解密（零依赖）
+    _win_crypto.py         Windows DPAPI + CNG AES-GCM / AES-CBC 解密（零依赖）
     _remote_push.py        通用 SSH 安全推送与本机导入辅助
     pull_doubao_cookie.py  Windows 豆包多 Profile Cookie 提取工具
     pull_qoder_cred.py     Windows Qoder / Qoder CN 凭据与设备指纹提取工具
+    pull_trae_cred.py      Windows TRAE CN 凭据与 P-256 设备密钥提取工具
   tests/
     test_core.py           加解密、锁竞争、HTTP 白名单与错误分类单测
     test_doubao.py         豆包 Cookie、海外回退、实时额度与去重单测
     test_qoder.py          Qoder 协议、轮次边界、配额与 Web 集成单测
+    test_trae.py           TRAE CN 协议、P-256 签名、续期与集成单测
 ```
 
 ## 单元测试
@@ -251,12 +270,12 @@ wbsignin/
 python3 -m unittest discover -s tests -v
 ```
 
-45 项离线单元测试全部不触网即可验证核心加解密、互斥锁、错误分类、豆包与 Qoder 协议兼容逻辑。
+51 项离线单元测试全部不触网即可验证核心加解密、互斥锁、错误分类、豆包、Qoder 与 TRAE CN 协议兼容逻辑。
 
 ## 协议致谢与声明
 
 - 接口协议契约仅作学习与互操作研究整理，代码由本项目独立实现，部分 WorkBuddy / 豆包协议参考了公开 MIT 实现（详见 `LICENSE`）。
-- 本项目与腾讯 WorkBuddy / CodeBuddy、字节跳动豆包、Qoder 官方无任何从属或关联关系；使用前请自行遵守相关服务条款。
+- 本项目与腾讯 WorkBuddy / CodeBuddy、字节跳动豆包、TRAE、Qoder 官方无任何从属或关联关系；使用前请自行遵守相关服务条款。
 
 ## License
 
