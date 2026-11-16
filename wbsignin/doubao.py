@@ -1,18 +1,17 @@
 """豆包（doubao.com）每日签到领体验额度。
 
-协议契约整理自 CreditDaddy / dsh-checkin-all（均为 MIT）的实测：
-    POST /alice/ug/campaign/v3/detail/       任务面板（含今日签到状态、总额度）
-    POST /alice/ug/campaign/landing/checkin  领取（+200 额度/天，服务端幂等）
+协议契约：
+    POST /alice/ug/campaign/v3/detail/       任务面板（国内 IP 可用；海外 IP 返回 code=2）
+    POST /alice/ug/campaign/landing/checkin  领取（服务端幂等；710010702 表示活动未开放或上游异常）
+    POST /alice/commerce/sale/subscription/overview/  真实剩余额度与到期明细（国内/海外 IP 均可用）
+    POST /alice/ug/campaign/quota/records/           激励额度流水与历史签到日期（国内/海外 IP 均可用）
 
-鉴权：纯 doubao.com 会话 Cookie，无 a_bogus / msToken 请求签名；但服务端按
-客户端环境放行，请求必须携带「豆包电脑版 webview」的请求形状：
-    - UA 带 DoubaoDesktop 标识
-    - URL 带 version_code / device_platform=web / aid 等平台参数
-    - web_id / tea_uuid 按账号 seed 确定性派生（每号一台稳定「设备」）
-    - device_id 留空（实测可过）
+鉴权：纯 doubao.com 会话 Cookie；请求必须携带「豆包电脑版 desktop webview」的
+完整客户端参数（aid=582478、runtime_version=3.44.9、region=CN 等）与确定性
+device_id / web_id / tea_uuid / fp 才会稳定命中 PC 签到活动与任务面板。
 
-参与门槛：仅个人账号。工作版（DoubaoWork）/ 飞书企业账号的任务面板里没有
-「每日签到」任务，服务端会回 710010702「系统错误」。
+参与门槛：仅个人账号。工作版 / 企业账号在 v3/detail 返回 code=0 但 tasks 中无 daily_signin；
+个人账号若遇到 /landing/checkin 返回 710010702「系统错误」，属上游活动服务故障，不能误判为无签到任务。
 """
 from __future__ import annotations
 
@@ -26,27 +25,34 @@ from .tasks import CreditSnapshot
 
 CAMPAIGN_GROUP = "pc_incentive_task_mvp_v3"
 LOGIN_INVALID = 710012001  # 会话过期 / Cookie 失效
-NO_ACTIVITY = 710010702    # Cookie 有效，但该账号没有可领的签到活动
+NO_ACTIVITY = 710010702    # 活动未开放或上游活动服务系统错误
 
 CLIENT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) DoubaoDesktop/2.32.6 Chrome/147.0.7727.149 Safari/537.36"
+    "(KHTML, like Gecko) DoubaoDesktop/2.35.12 Chrome/147.0.7727.149 Safari/537.36"
 )
 
 COMMON_PARAMS = {
     "version_code": "20800",
     "language": "zh",
     "device_platform": "web",
-    "doubao_device_platform": "web",
-    "aid": "497858",
-    "real_aid": "497858",
+    "doubao_device_platform": "desktop",
+    "aid": "582478",
+    "real_aid": "582478",
     "pkg_type": "release_version",
-    "pc_version": "2.32.6",
-    "doubao_pc_version": "5.72.66",
+    "pc_version": "2.35.12",
+    "doubao_pc_version": "2.35.12",
     "samantha_web": "1",
     "web_platform": "desktop",
     "use-olympus-account": "1",
     "web_tab_id": "0",
+    "region": "CN",
+    "sys_region": "CN",
+    "runtime": "web",
+    "runtime_version": "3.44.9",
+    "client_platform": "pc_client",
+    "chromium_version": "147.0.7727.149",
+    "channel": "win",
 }
 
 # 状态（对齐 runner 的签到状态词汇，便于前端复用）
@@ -88,17 +94,21 @@ def cookie_uid(cookie: str) -> str:
 
 
 def device_ids(seed: str) -> Dict[str, str]:
-    """按账号 seed 派生稳定的 web_id / tea_uuid（每号恒定、账号间互异）。"""
+    """按账号 seed 派生稳定的桌面端设备参数（每号恒定、账号间互异）。"""
     h = hashlib.sha256(("doubao-dev:" + (seed or "anonymous")).encode("utf-8")).digest()
-    web_id = "76" + "".join(str(b % 10) for b in h[:8])
-    tea_uuid = "".join(str(b % 10) for b in h[8:16]).ljust(16, "7")
-    return {"web_id": web_id, "tea_uuid": tea_uuid}
+    device_id = "4" + "".join(str(b % 10) for b in h[:15])
+    web_id = "76" + "".join(str(b % 10) for b in h[15:32])
+    return {
+        "device_id": device_id,
+        "web_id": web_id,
+        "tea_uuid": device_id,
+        "fp": "verify_" + device_id,
+    }
 
 
 def _api_url(base: str, seed: str) -> str:
     params: Dict[str, str] = dict(COMMON_PARAMS)
     params.update(device_ids(seed))
-    params.update({"device_id": "", "region": "", "sys_region": ""})
     return base + "?" + urllib.parse.urlencode(params)
 
 
@@ -109,8 +119,28 @@ def _headers(cookie: str) -> Dict[str, str]:
         "Accept": "application/json, text/plain, */*",
         "Referer": "https://www.doubao.com/pc/agent-explore",
         "Origin": "https://www.doubao.com",
+        "Agw-Js-Conv": "str",
         "User-Agent": CLIENT_UA,
     }
+
+
+def _post(
+    url_base: str,
+    cookie: str,
+    body: Dict[str, Any],
+    seed: str = "",
+    retries: int = 2,
+) -> httpc.Response:
+    """发送豆包 POST JSON 请求，按需附带 WBSIGNIN_DOUBAO_PROXY。"""
+    kwargs: Dict[str, Any] = {
+        "headers": _headers(cookie),
+        "body": body,
+        "retries": retries,
+    }
+    proxy = config.doubao_proxy()
+    if proxy:
+        kwargs["proxy_url"] = proxy
+    return httpc.request("POST", _api_url(url_base, seed), **kwargs)
 
 
 def _code_int(payload: Any) -> Any:
@@ -159,12 +189,11 @@ def doubao_quota_records(cookie: str, seed: str = "") -> Dict[str, Any]:
 
     for _ in range(5):
         try:
-            resp = httpc.request(
-                "POST",
-                _api_url(config.DOUBAO_QUOTA_RECORDS_URL, seed),
-                headers=_headers(cookie),
-                body={"cursor": cursor, "page_size": 100},
-                retries=2,
+            resp = _post(
+                config.DOUBAO_QUOTA_RECORDS_URL,
+                cookie,
+                {"cursor": cursor, "page_size": 100},
+                seed=seed,
             )
         except httpc.ApiError as exc:
             return {"auth": False, "code": None, "error": exc.detail}
@@ -220,15 +249,57 @@ def doubao_quota_records(cookie: str, seed: str = "") -> Dict[str, Any]:
     }
 
 
+def _fetch_detail(cookie: str, seed: str = "") -> Dict[str, Any]:
+    """请求 /alice/ug/campaign/v3/detail/ 并统一解析 code / payload。"""
+    try:
+        resp = _post(
+            config.DOUBAO_DETAIL_URL,
+            cookie,
+            {"campaign_group_code": CAMPAIGN_GROUP},
+            seed=seed,
+        )
+    except httpc.ApiError as exc:
+        return {"ok": False, "code": None, "error": exc.detail}
+
+    payload = resp.payload
+    if not isinstance(payload, dict):
+        return {
+            "ok": False,
+            "code": "HTTP %s" % resp.status,
+            "error": "响应非 JSON",
+        }
+    return {"ok": True, "code": _code_int(payload), "payload": payload}
+
+
+def _extract_daily_task(data: Dict[str, Any]) -> Tuple[Optional[dict], List[str]]:
+    tasks: List[dict] = [t for t in (data.get("tasks") or []) if isinstance(t, dict)]
+    task = next((t for t in tasks if t.get("task_kind") == "daily_signin"), None)
+    kinds = sorted({str(t.get("task_kind")) for t in tasks if t.get("task_kind")})
+    return task, kinds
+
+
+def _resolve_credits(
+    cookie: str,
+    seed: str = "",
+    rec: Optional[Dict[str, Any]] = None,
+) -> Tuple[Any, CreditSnapshot, Dict[str, Any]]:
+    snap, expiry = doubao_credits(cookie, seed)
+    if not snap.error:
+        return snap.total_remain, snap, expiry
+    if rec is None:
+        rec = doubao_quota_records(cookie, seed)
+    total: Any = rec.get("total_amount", 0) if rec.get("auth") else 0
+    return total, snap, expiry
+
+
 def _claim_landing(cookie: str, seed: str = "") -> Dict[str, Any]:
     """调用服务端幂等签到端点 /alice/ug/campaign/landing/checkin。"""
     try:
-        resp = httpc.request(
-            "POST",
-            _api_url(config.DOUBAO_CHECKIN_URL, seed),
-            headers=_headers(cookie),
-            body={"scene": CAMPAIGN_GROUP},
-            retries=2,
+        resp = _post(
+            config.DOUBAO_CHECKIN_URL,
+            cookie,
+            {"scene": CAMPAIGN_GROUP},
+            seed=seed,
         )
     except httpc.ApiError as exc:
         return {"state": ST_FAILED, "error": exc.detail}
@@ -239,11 +310,26 @@ def _claim_landing(cookie: str, seed: str = "") -> Dict[str, Any]:
 
     code = _code_int(payload)
     if code == LOGIN_INVALID:
-        return {"state": ST_FAILED, "error": "豆包登录已过期", "auth_expired": True}
+        return {
+            "state": ST_FAILED,
+            "code": code,
+            "error": "豆包登录已过期",
+            "auth_expired": True,
+        }
     if code == NO_ACTIVITY:
-        return {"state": ST_NO_TASK, "error": "该账号没有可领的签到活动"}
+        msg = _msg(payload) or "上游活动接口异常"
+        return {
+            "state": ST_FAILED,
+            "code": code,
+            "upstream_code": code,
+            "error": "%s（code %s）" % (msg, code),
+        }
     if code != 0:
-        return {"state": ST_FAILED, "error": _msg(payload) + "（code %s）" % code}
+        return {
+            "state": ST_FAILED,
+            "code": code,
+            "error": _msg(payload) + "（code %s）" % code,
+        }
 
     d = payload.get("data") or {}
     amount = _int(d.get("reward_amount")) or 200
@@ -266,59 +352,65 @@ def doubao_status(cookie: str, seed: str = "") -> Dict[str, Any]:
     """查任务面板：签到状态 + 总体验额度。
 
     注：/v3/detail/ 对海外出口 IP 会返回 code=2 (campaign not found)，
-    此时自动降级为幂等 /landing/checkin + /quota/records/ 组合获取状态与总额度。
+    此时降级结合 /quota/records/ 与 /landing/checkin + /subscription/overview/ 确认 Cookie
+    有效性及余额；若 /quota/records/ 已确认会话有效，即使签到端点返回 710010702
+    也仍视为 auth=True，保证本地/服务端导入与刷新 Cookie 不受上游活动故障阻塞。
     """
-    try:
-        resp = httpc.request(
-            "POST", _api_url(config.DOUBAO_DETAIL_URL, seed),
-            headers=_headers(cookie),
-            body={"campaign_group_code": CAMPAIGN_GROUP},
-            retries=2,
-        )
-    except httpc.ApiError as exc:
-        return {"auth": False, "code": None, "error": exc.detail}
+    det = _fetch_detail(cookie, seed)
+    if not det["ok"]:
+        return {"auth": False, "code": det["code"], "error": det["error"]}
 
-    payload = resp.payload
-    if not isinstance(payload, dict):
-        return {"auth": False, "code": "HTTP %s" % resp.status, "error": "响应非 JSON"}
-
-    code = _code_int(payload)
+    code = det["code"]
+    payload = det["payload"]
     if code == LOGIN_INVALID:
         return {"auth": False, "code": code, "error": "豆包登录已过期（Cookie 失效）"}
+
     if code == 2:
-        # 海外服务器 IP 被 /v3/detail/ 地域过滤，走无地域限制的幂等 checkin + overview 真实余额
         claim = _claim_landing(cookie, seed)
-        if claim.get("state") == ST_NO_TASK:
-            return {"auth": True, "code": 0, "no_task": True, "kinds": []}
-        if claim.get("state") not in (ST_SIGNED, ST_ALREADY):
+        if claim.get("auth_expired"):
             return {
                 "auth": False,
-                "code": code,
-                "error": claim.get("error", "活动面板不可用（code 2）"),
+                "code": LOGIN_INVALID,
+                "error": claim.get("error", "豆包登录已过期"),
             }
-        snap, _exp = doubao_credits(cookie, seed)
-        if not snap.error:
-            total: Any = snap.total_remain
-        else:
-            rec = doubao_quota_records(cookie, seed)
-            total = rec.get("total_amount", 0) if rec.get("auth") else 0
+        if claim.get("state") in (ST_SIGNED, ST_ALREADY):
+            total, _snap, _exp = _resolve_credits(cookie, seed)
+            return {
+                "auth": True,
+                "code": 0,
+                "checked_in": True,
+                "just_signed": claim.get("state") == ST_SIGNED,
+                "continuous_days": claim.get("continuous_days", 0),
+                "reward_amount": claim.get("reward_amount", 200),
+                "total_amount": total,
+            }
+        rec = doubao_quota_records(cookie, seed)
+        if rec.get("code") == LOGIN_INVALID:
+            return {"auth": False, "code": LOGIN_INVALID, "error": "豆包登录已过期（Cookie 失效）"}
+        if rec.get("auth"):
+            # /landing/checkin 返回 710010702 等错误时，仍以 quota/records 放行有效 Cookie
+            total, _snap, _exp = _resolve_credits(cookie, seed, rec=rec)
+            return {
+                "auth": True,
+                "code": 0,
+                "checked_in": bool(rec.get("checked_in")),
+                "continuous_days": 0,
+                "reward_amount": rec.get("reward_amount", 200),
+                "total_amount": total,
+                "claim_error": claim.get("error", ""),
+            }
         return {
-            "auth": True,
-            "code": 0,
-            "checked_in": True,
-            "just_signed": claim.get("state") == ST_SIGNED,
-            "continuous_days": claim.get("continuous_days", 0),
-            "reward_amount": claim.get("reward_amount", 200),
-            "total_amount": total,
+            "auth": False,
+            "code": code,
+            "error": claim.get("error") or rec.get("error") or "活动面板不可用（code 2）",
         }
+
     if code != 0:
         return {"auth": False, "code": code, "error": _msg(payload) + "（code %s）" % code}
 
     data = payload.get("data") or {}
-    tasks: List[dict] = [t for t in (data.get("tasks") or []) if isinstance(t, dict)]
-    task = next((t for t in tasks if t.get("task_kind") == "daily_signin"), None)
+    task, kinds = _extract_daily_task(data)
     if task is None:
-        kinds = sorted({str(t.get("task_kind")) for t in tasks if t.get("task_kind")})
         return {"auth": True, "code": code, "no_task": True, "kinds": kinds}
 
     c = task.get("daily_checkin") or {}
@@ -371,12 +463,11 @@ def doubao_credits(
 ) -> Tuple[CreditSnapshot, Dict[str, Any]]:
     """查询豆包真实剩余额度明细与最近到期信息（国内/海外 IP 均可用）。"""
     try:
-        resp = httpc.request(
-            "POST",
-            _api_url(config.DOUBAO_OVERVIEW_URL, seed),
-            headers=_headers(cookie),
-            body={"product_line": "membership"},
-            retries=2,
+        resp = _post(
+            config.DOUBAO_OVERVIEW_URL,
+            cookie,
+            {"product_line": "membership"},
+            seed=seed,
         )
     except httpc.ApiError as exc:
         return CreditSnapshot(error=exc.detail), {}
@@ -525,37 +616,124 @@ def doubao_credits(
     )
 
 
-# ---------- 签到 ----------
-def doubao_checkin(cookie: str, seed: str = "") -> Dict[str, Any]:
-    """签到主流程：优先调幂等签到接口并结合 overview 返回真实剩余额度。"""
-    claim = _claim_landing(cookie, seed)
-    state = claim.get("state")
-    if state in (ST_FAILED, ST_NO_TASK):
-        return claim
-
-    snap, expiry = doubao_credits(cookie, seed)
-    if not snap.error:
-        total: Any = snap.total_remain
-    else:
-        rec = doubao_quota_records(cookie, seed)
-        total = rec.get("total_amount", 0) if rec.get("auth") else 0
-
-    if state == ST_ALREADY:
-        return {
-            "state": ST_ALREADY,
-            "continuous_days": claim.get("continuous_days", 0),
-            "total_amount": total,
-            "snap": snap,
-            "expiry": expiry,
-        }
-
-    amount = claim.get("reward_amount", 200) or 200
-    days = claim.get("continuous_days", 0) or 1
-    return {
-        "state": ST_SIGNED,
-        "reward_amount": amount,
+def _checkin_success(
+    state: str,
+    cookie: str,
+    seed: str,
+    days: int,
+    amount: int,
+    rec: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    total, snap, expiry = _resolve_credits(cookie, seed, rec=rec)
+    out: Dict[str, Any] = {
+        "state": state,
         "continuous_days": days,
         "total_amount": total,
         "snap": snap,
         "expiry": expiry,
+    }
+    if state == ST_SIGNED:
+        out["reward_amount"] = amount or 200
+    elif amount:
+        out["reward_amount"] = amount
+    return out
+
+
+# ---------- 签到 ----------
+def doubao_checkin(cookie: str, seed: str = "") -> Dict[str, Any]:
+    """签到主流程：先查 /v3/detail/ 任务面板，再按状态调用 /landing/checkin 与 overview。"""
+    det = _fetch_detail(cookie, seed)
+    if not det["ok"]:
+        return {"state": ST_FAILED, "error": det["error"]}
+
+    code = det["code"]
+    payload = det["payload"]
+    if code == LOGIN_INVALID:
+        return {
+            "state": ST_FAILED,
+            "code": code,
+            "error": "豆包登录已过期（Cookie 失效）",
+            "auth_expired": True,
+        }
+
+    if code == 0:
+        data = payload.get("data") or {}
+        task, kinds = _extract_daily_task(data)
+        if task is None:
+            return {
+                "state": ST_NO_TASK,
+                "error": "该账号没有可领的每日签到任务",
+                "kinds": kinds,
+            }
+        c = task.get("daily_checkin") or {}
+        reward = c.get("reward") or {}
+        days = _int(c.get("continuous_days"))
+        amount = _int(reward.get("reward_amount")) or 200
+        if c.get("checked_in_today") is True:
+            return _checkin_success(ST_ALREADY, cookie, seed, days, amount)
+
+        claim = _claim_landing(cookie, seed)
+        c_state = claim.get("state")
+        if c_state in (ST_SIGNED, ST_ALREADY):
+            return _checkin_success(
+                c_state,
+                cookie,
+                seed,
+                claim.get("continuous_days") or days or (1 if c_state == ST_SIGNED else 0),
+                claim.get("reward_amount") or amount,
+            )
+        if claim.get("upstream_code") == NO_ACTIVITY:
+            claim = dict(claim)
+            claim["error"] = (
+                "存在每日签到任务（daily_signin，今日 +%d 额度），"
+                "但签到接口返回 710010702 系统错误（豆包服务端故障）" % amount
+            )
+        return claim
+
+    if code == 2:
+        rec = doubao_quota_records(cookie, seed)
+        if rec.get("code") == LOGIN_INVALID:
+            return {
+                "state": ST_FAILED,
+                "code": LOGIN_INVALID,
+                "error": "豆包登录已过期（Cookie 失效）",
+                "auth_expired": True,
+            }
+        if rec.get("auth") and rec.get("checked_in"):
+            return _checkin_success(
+                ST_ALREADY,
+                cookie,
+                seed,
+                0,
+                _int(rec.get("reward_amount")) or 200,
+                rec=rec,
+            )
+        claim = _claim_landing(cookie, seed)
+        c_state = claim.get("state")
+        if c_state in (ST_SIGNED, ST_ALREADY):
+            return _checkin_success(
+                c_state,
+                cookie,
+                seed,
+                claim.get("continuous_days") or (1 if c_state == ST_SIGNED else 0),
+                claim.get("reward_amount") or 200,
+                rec=rec if rec.get("auth") else None,
+            )
+        if claim.get("upstream_code") == NO_ACTIVITY:
+            hist = (
+                "（最近签到日期 %s）" % rec.get("latest_signin_date")
+                if rec.get("auth") and rec.get("latest_signin_date")
+                else ""
+            )
+            claim = dict(claim)
+            claim["error"] = (
+                "海外 IP 受限（v3/detail code 2）且签到接口返回 710010702%s；"
+                "建议在本地运行或配置 WBSIGNIN_DOUBAO_PROXY" % hist
+            )
+        return claim
+
+    return {
+        "state": ST_FAILED,
+        "code": code,
+        "error": _msg(payload) + "（code %s）" % code,
     }

@@ -283,11 +283,20 @@ def _work_doubao(acc: Account, want_credits: bool = True) -> AccountOutcome:
             detail="今日已签到（连续 %d 天）" % r.get("continuous_days", 0),
         )
     elif r.get("state") == doubao.ST_NO_TASK:
-        out.checkin = CheckinResult(status=ST_SKIPPED, detail="该账号无签到任务")
+        out.checkin = CheckinResult(
+            status=ST_SKIPPED,
+            kind=httpc.KIND_NOT_CLAIMABLE,
+            detail="该账号无签到任务",
+        )
         out.note = "；".join(r.get("kinds", []))
     else:
-        out.checkin = CheckinResult(status=ST_FAILED, detail=r.get("error", "签到失败"))
-    if want_credits:
+        kind = httpc.KIND_AUTH if r.get("auth_expired") else httpc.KIND_SERVER
+        out.checkin = CheckinResult(
+            status=ST_FAILED,
+            kind=kind,
+            detail=r.get("error", "签到失败"),
+        )
+    if want_credits and not r.get("auth_expired"):
         snap = r.get("snap")
         exp = r.get("expiry")
         if isinstance(snap, CreditSnapshot) and not snap.error:
@@ -299,6 +308,11 @@ def _work_doubao(acc: Account, want_credits: bool = True) -> AccountOutcome:
             doubao.ST_ALREADY,
         ):
             out.credits = CreditSnapshot(total_remain=float(r["total_amount"]))
+        elif not isinstance(snap, CreditSnapshot):
+            snap, exp = doubao.doubao_credits(acc.cookie, acc.uid or "")
+            out.credits = snap
+            if isinstance(exp, dict) and not snap.error:
+                out.expiry = exp
     return out
 
 

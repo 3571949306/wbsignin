@@ -22,9 +22,15 @@ RESOURCE_URL = BASE + "/billing/meter/get-user-resource"
 
 # 豆包（doubao.com）
 DOUBAO_DETAIL_URL = "https://www.doubao.com/alice/ug/campaign/v3/detail/"
+DOUBAO_LANDING_GET_URL = "https://www.doubao.com/alice/ug/campaign/landing/get"
 DOUBAO_CHECKIN_URL = "https://www.doubao.com/alice/ug/campaign/landing/checkin"
 DOUBAO_QUOTA_RECORDS_URL = "https://www.doubao.com/alice/ug/campaign/quota/records/"
 DOUBAO_OVERVIEW_URL = "https://www.doubao.com/alice/commerce/sale/subscription/overview/"
+
+
+def doubao_proxy() -> str:
+    """可选的豆包专用国内代理（环境变量 WBSIGNIN_DOUBAO_PROXY）。"""
+    return os.environ.get("WBSIGNIN_DOUBAO_PROXY", "").strip()
 
 # Qoder（国际版 / 国内版）
 QODER_INTL_BASE = "https://openapi.qoder.sh"

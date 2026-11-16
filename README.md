@@ -127,7 +127,10 @@ python tools/pull_doubao_cookie.py --local
 python tools/pull_doubao_cookie.py --push --host <your-server>
 ```
 
-> 说明：仅豆包个人账号拥有「每日签到」任务；工作版 / 飞书企业账号服务端无此任务。当桌面版豆包正在运行时，正在使用中的 `Default\Network\Cookies` 可能被操作系统锁定而自动跳过，关闭豆包桌面端后即可读取该配置档。
+> 说明：
+> - 仅豆包个人账号拥有 `daily_signin` 每日签到任务；工作版 / 飞书企业账号在 `/v3/detail/` 返回的 `tasks` 中无此任务。
+> - 客户端参数已对齐豆包电脑版桌面端请求特征（`aid=582478`、`runtime_version=3.44.9`、`doubao_device_platform=desktop` 与确定性 `device_id` / `web_id` / `fp`）；当系统处于正在运行的 `Default\Network\Cookies` 被锁定时，关闭豆包桌面端后即可读取该配置档。
+> - 若服务器位于海外，`/v3/detail/` 会返回 `code=2` 地域限制，程序将结合 `/quota/records/`、`/landing/checkin` 与 `/subscription/overview/` 保留余额、到期时间及最近签到记录；如上游 `/landing/checkin` 返回 `710010702` 系统错误，将明确报告为活动故障并继续保留真实余额，也可通过环境变量 `WBSIGNIN_DOUBAO_PROXY=http://127.0.0.1:PORT`（支持 `http`/`https` 代理）经国内出口代理访问豆包接口。
 
 ### 3. 添加 Qoder 账号（国内版 & 国际版）
 
@@ -248,7 +251,7 @@ wbsignin/
 python3 -m unittest discover -s tests -v
 ```
 
-38 项离线单元测试全部不触网即可验证核心加解密、互斥锁、错误分类、豆包与 Qoder 协议兼容逻辑。
+45 项离线单元测试全部不触网即可验证核心加解密、互斥锁、错误分类、豆包与 Qoder 协议兼容逻辑。
 
 ## 协议致谢与声明
 

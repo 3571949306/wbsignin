@@ -42,12 +42,28 @@ class TestDeviceIds(unittest.TestCase):
 
     def test_format(self):
         d = doubao.device_ids("anyseed")
-        # 参考实现实际生成 '76' + 8 位单数字 = 10 位（注释里的"18位"是笔误）
+        self.assertTrue(d["device_id"].startswith("4"))
+        self.assertEqual(len(d["device_id"]), 16)
+        self.assertTrue(d["device_id"].isdigit())
         self.assertTrue(d["web_id"].startswith("76"))
-        self.assertEqual(len(d["web_id"]), 10)
-        self.assertEqual(len(d["tea_uuid"]), 16)
+        self.assertEqual(len(d["web_id"]), 19)
         self.assertTrue(d["web_id"].isdigit())
-        self.assertTrue(d["tea_uuid"].isdigit())
+        self.assertEqual(d["tea_uuid"], d["device_id"])
+        self.assertEqual(d["fp"], "verify_" + d["device_id"])
+
+    def test_api_url_desktop_params(self):
+        import urllib.parse
+        from wbsignin import config
+
+        u = doubao._api_url(config.DOUBAO_DETAIL_URL, "seed1")
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(u).query))
+        self.assertEqual(q["aid"], "582478")
+        self.assertEqual(q["real_aid"], "582478")
+        self.assertEqual(q["doubao_device_platform"], "desktop")
+        self.assertEqual(q["runtime_version"], "3.44.9")
+        self.assertEqual(q["region"], "CN")
+        self.assertEqual(q["fp"], "verify_" + q["device_id"])
+        self.assertEqual(doubao._headers("sid=1").get("Agw-Js-Conv"), "str")
 
 
 class OverseasFallbackTests(unittest.TestCase):
@@ -204,9 +220,27 @@ class OverseasFallbackTests(unittest.TestCase):
                 },
             }
         )
+        detail_pending = self._resp(
+            {
+                "code": 0,
+                "data": {
+                    "tasks": [
+                        {
+                            "task_kind": "daily_signin",
+                            "daily_checkin": {
+                                "checked_in_today": False,
+                                "continuous_days": 7,
+                                "reward": {"reward_amount": 200},
+                            },
+                        }
+                    ]
+                },
+            }
+        )
         with patch(
             "wbsignin.httpc.request",
             side_effect=[
+                detail_pending,
                 self._resp({"code": 0, "data": {"idempotent": False, "continuous_days": 8, "reward_amount": 200}}),
                 ov_ok,
             ],
@@ -221,6 +255,7 @@ class OverseasFallbackTests(unittest.TestCase):
         with patch(
             "wbsignin.httpc.request",
             side_effect=[
+                detail_pending,
                 self._resp({"code": 0, "data": {"idempotent": True, "continuous_days": 7}}),
                 self._resp({"code": 500}, status=500),
                 self._resp({"code": 0, "data": {"has_more": False, "records": [{"amount": 3500}]}}),
@@ -232,10 +267,11 @@ class OverseasFallbackTests(unittest.TestCase):
 
         with patch(
             "wbsignin.httpc.request",
-            return_value=self._resp({"code": doubao.NO_ACTIVITY, "msg": "no activity"}),
+            return_value=self._resp({"code": 0, "data": {"tasks": [{"task_kind": "other_task"}]}}),
         ):
             r3 = doubao.doubao_checkin("sessionid=abc", seed="s1")
         self.assertEqual(r3["state"], doubao.ST_NO_TASK)
+        self.assertEqual(r3["kinds"], ["other_task"])
 
         with patch(
             "wbsignin.httpc.request",
@@ -244,6 +280,228 @@ class OverseasFallbackTests(unittest.TestCase):
             r4 = doubao.doubao_checkin("sessionid=abc", seed="s1")
         self.assertEqual(r4["state"], doubao.ST_FAILED)
         self.assertTrue(r4.get("auth_expired"))
+
+    def test_checkin_detail_already_short_circuit(self):
+        from unittest.mock import patch
+
+        called = []
+
+        def fake_req(method, url, **kw):
+            called.append(url)
+            if "/v3/detail/" in url:
+                return self._resp(
+                    {
+                        "code": 0,
+                        "data": {
+                            "tasks": [
+                                {
+                                    "task_kind": "daily_signin",
+                                    "daily_checkin": {
+                                        "checked_in_today": True,
+                                        "continuous_days": 7,
+                                        "reward": {"reward_amount": 400},
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                )
+            if "/landing/checkin" in url:
+                raise AssertionError("already checked in should not call /landing/checkin")
+            if "/subscription/overview/" in url:
+                return self._resp({"code": 0, "data": {"quota_balance_overview": {"total_remaining_amount": "8,754"}}})
+            raise AssertionError("unexpected url: " + url)
+
+        with patch("wbsignin.httpc.request", side_effect=fake_req):
+            r = doubao.doubao_checkin("sessionid=abc", seed="s1")
+        self.assertEqual(r["state"], doubao.ST_ALREADY)
+        self.assertEqual(r["continuous_days"], 7)
+        self.assertEqual(r["total_amount"], 8754.0)
+        self.assertFalse(any("/landing/checkin" in u for u in called))
+
+    def test_checkin_daily_signin_present_710010702_is_failed(self):
+        from unittest.mock import patch
+
+        def fake_req(method, url, **kw):
+            if "/v3/detail/" in url:
+                return self._resp(
+                    {
+                        "code": 0,
+                        "data": {
+                            "tasks": [
+                                {
+                                    "task_kind": "daily_signin",
+                                    "daily_checkin": {
+                                        "checked_in_today": False,
+                                        "continuous_days": 7,
+                                        "reward": {"reward_amount": 400},
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                )
+            if "/landing/checkin" in url:
+                return self._resp({"code": doubao.NO_ACTIVITY, "message": "系统错误"})
+            raise AssertionError("unexpected url: " + url)
+
+        with patch("wbsignin.httpc.request", side_effect=fake_req):
+            r = doubao.doubao_checkin("sessionid=abc", seed="s1")
+        self.assertEqual(r["state"], doubao.ST_FAILED)
+        self.assertEqual(r.get("upstream_code"), doubao.NO_ACTIVITY)
+        self.assertIn("daily_signin", r["error"])
+        self.assertIn("710010702", r["error"])
+
+    def test_checkin_code2_overseas_710010702_with_records_history(self):
+        import datetime
+        from unittest.mock import patch
+        from wbsignin import config
+
+        old_dt = datetime.datetime.now(config.BJ_TZ) - datetime.timedelta(days=2)
+        old_ms = int(old_dt.timestamp() * 1000)
+        expected_date = old_dt.strftime("%Y-%m-%d")
+
+        def fake_req(method, url, **kw):
+            if "/v3/detail/" in url:
+                return self._resp({"code": 2, "data": None, "message": "campaign not found"})
+            if "/quota/records/" in url:
+                return self._resp(
+                    {
+                        "code": 0,
+                        "data": {
+                            "has_more": False,
+                            "records": [
+                                {"amount": 200, "task_code": "daily_signin", "create_time_ms": old_ms}
+                            ],
+                        },
+                    }
+                )
+            if "/landing/checkin" in url:
+                return self._resp({"code": doubao.NO_ACTIVITY, "message": "系统错误"})
+            raise AssertionError("unexpected url: " + url)
+
+        with patch("wbsignin.httpc.request", side_effect=fake_req):
+            r = doubao.doubao_checkin("sessionid=abc", seed="s1")
+        self.assertEqual(r["state"], doubao.ST_FAILED)
+        self.assertEqual(r.get("upstream_code"), doubao.NO_ACTIVITY)
+        self.assertIn(expected_date, r["error"])
+        self.assertIn("710010702", r["error"])
+        self.assertIn("WBSIGNIN_DOUBAO_PROXY", r["error"])
+
+        # 若海外场景下 quota/records 显示今日已签，直接返回 ST_ALREADY 且不再打 /landing/checkin
+        today_ms = int(datetime.datetime.now(config.BJ_TZ).timestamp() * 1000)
+
+        def fake_req_today(method, url, **kw):
+            if "/v3/detail/" in url:
+                return self._resp({"code": 2, "data": None})
+            if "/quota/records/" in url:
+                return self._resp(
+                    {
+                        "code": 0,
+                        "data": {
+                            "has_more": False,
+                            "records": [
+                                {"amount": 400, "task_code": "daily_signin", "create_time_ms": today_ms}
+                            ],
+                        },
+                    }
+                )
+            if "/subscription/overview/" in url:
+                return self._resp({"code": 0, "data": {"quota_balance_overview": {"total_remaining_amount": "9,154"}}})
+            raise AssertionError("unexpected url: " + url)
+
+        with patch("wbsignin.httpc.request", side_effect=fake_req_today):
+            r_today = doubao.doubao_checkin("sessionid=abc", seed="s1")
+        self.assertEqual(r_today["state"], doubao.ST_ALREADY)
+        self.assertEqual(r_today["total_amount"], 9154.0)
+
+    def test_status_code2_fallback_auth_when_landing_710010702(self):
+        from unittest.mock import patch
+
+        def fake_req(method, url, **kw):
+            if "/v3/detail/" in url:
+                return self._resp({"code": 2, "data": None, "message": "campaign not found"})
+            if "/landing/checkin" in url:
+                return self._resp({"code": doubao.NO_ACTIVITY, "message": "系统错误"})
+            if "/quota/records/" in url:
+                return self._resp({"code": 0, "data": {"has_more": False, "records": [{"amount": 200}]}})
+            if "/subscription/overview/" in url:
+                return self._resp({"code": 0, "data": {"quota_balance_overview": {"total_remaining_amount": "8,754"}}})
+            raise AssertionError("unexpected url: " + url)
+
+        with patch("wbsignin.httpc.request", side_effect=fake_req):
+            st = doubao.doubao_status("sessionid=abc; uid_tt=u1", seed="s1")
+        self.assertTrue(st["auth"])
+        self.assertFalse(st["checked_in"])
+        self.assertEqual(st["total_amount"], 8754.0)
+        self.assertIn("710010702", st["claim_error"])
+
+    def test_proxy_forwarding_and_scheme_validation(self):
+        import os
+        from unittest.mock import patch
+        from wbsignin import config, httpc
+
+        seen_kwargs = {}
+
+        def fake_req(method, url, **kw):
+            seen_kwargs.update(kw)
+            return self._resp({"code": 0, "data": {}})
+
+        with patch.dict(os.environ, {"WBSIGNIN_DOUBAO_PROXY": "http://127.0.0.1:7890"}):
+            with patch("wbsignin.httpc.request", side_effect=fake_req):
+                doubao._post(config.DOUBAO_DETAIL_URL, "sid=1", {"campaign_group_code": "x"})
+        self.assertEqual(seen_kwargs.get("proxy_url"), "http://127.0.0.1:7890")
+
+        with self.assertRaises(httpc.ApiError) as ctx:
+            httpc.request("POST", config.DOUBAO_DETAIL_URL, proxy_url="socks5://127.0.0.1:1080")
+        self.assertEqual(ctx.exception.kind, httpc.KIND_BAD_HOST)
+
+    def test_runner_work_doubao_keeps_credits_on_checkin_failure(self):
+        from unittest.mock import patch
+        from wbsignin import httpc, runner
+        from wbsignin.auth import Account
+
+        acc = Account(phone="doubao:seed1", provider="doubao", cookie="sessionid=1", uid="seed1", label="豆包主号")
+
+        def fake_req(method, url, **kw):
+            if "/v3/detail/" in url:
+                return self._resp({"code": 2, "data": None})
+            if "/quota/records/" in url:
+                return self._resp({"code": 0, "data": {"has_more": False, "records": []}})
+            if "/landing/checkin" in url:
+                return self._resp({"code": doubao.NO_ACTIVITY, "message": "系统错误"})
+            if "/subscription/overview/" in url:
+                return self._resp(
+                    {
+                        "code": 0,
+                        "data": {
+                            "quota_balance_overview": {
+                                "total_remaining_amount": "8,754",
+                                "top_items": [
+                                    {"display_name": "标准套餐", "end_time": 1796290560301, "total_amount": "9,000", "used_amount": "246"}
+                                ],
+                            },
+                            "package_entitlement_groups": [
+                                {"entitlements": [{"display": {"title": "标准套餐"}, "end_time": 1796290560301, "total_amount": "9,000", "used_amount": "246"}]}
+                            ],
+                        },
+                    }
+                )
+            raise AssertionError("unexpected url: " + url)
+
+        with patch("wbsignin.httpc.request", side_effect=fake_req):
+            out = runner._work_doubao(acc, want_credits=True)
+        self.assertEqual(out.checkin.status, runner.ST_FAILED)
+        self.assertEqual(out.checkin.kind, httpc.KIND_SERVER)
+        self.assertIsNotNone(out.credits)
+        self.assertEqual(out.credits.total_remain, 8754.0)
+        self.assertEqual(out.expiry.get("name"), "标准套餐")
+
+        with patch("wbsignin.httpc.request", return_value=self._resp({"code": doubao.LOGIN_INVALID, "msg": "expired"})):
+            out_exp = runner._work_doubao(acc, want_credits=True)
+        self.assertEqual(out_exp.checkin.status, runner.ST_FAILED)
+        self.assertEqual(out_exp.checkin.kind, httpc.KIND_AUTH)
+        self.assertIsNone(out_exp.credits)
 
     def test_cookie_uid_and_upsert_dedup(self):
         import tempfile

@@ -83,6 +83,19 @@ def new_message_id() -> str:
     return "%012x%s" % (int(time.time() * 1000), uuid.uuid4().hex[:20])
 
 
+def _open_url(req: urllib.request.Request, timeout: float, proxy_url: str = ""):
+    proxy = (proxy_url or "").strip()
+    if not proxy:
+        return urllib.request.urlopen(req, timeout=timeout)
+    parsed = urllib.parse.urlsplit(proxy)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ApiError(KIND_BAD_HOST, "不支持的代理地址：%r（仅支持 http/https）" % proxy)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+    return opener.open(req, timeout=timeout)
+
+
 def request(
     method: str,
     url: str,
@@ -91,6 +104,7 @@ def request(
     timeout: float = config.REQUEST_TIMEOUT,
     retries: int = config.MAX_RETRIES,
     gap: float = config.RETRY_GAP,
+    proxy_url: str = "",
 ) -> Response:
     """发请求。仅对「网络错误 / 5xx」重试，4xx 一律不重试。"""
     _check_host(url)
@@ -105,7 +119,7 @@ def request(
     for attempt in range(1, max(1, retries) + 1):
         req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as fp:
+            with _open_url(req, timeout=timeout, proxy_url=proxy_url) as fp:
                 raw = fp.read()
                 status = fp.status
             resp = _parse(status, raw)
